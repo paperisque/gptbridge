@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "name": "Gptgraber Voice Bridge",
+  "version": "0.1.0",
+  "description": "Читает композер ChatGPT и шлёт текст C#-серверу VoiceBridge по WebSocket (localhost).",
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gptgraber@local",
+      "strict_min_version": "115.0"
+    }
+  },
+
+  "permissions": [
+    "ws://localhost:17890/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+
+  "browser_action": {
+    "default_title": "Gptgraber — статус моста"
+  }
+}

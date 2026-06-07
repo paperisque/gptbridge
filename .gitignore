@@ -1,0 +1,17 @@
+# ---- .NET / C# ----
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+
+# Visual Studio
+.vs/
+
+# ---- Editors ----
+.idea/
+*.swp
+
+# ---- OS ----
+Thumbs.db
+desktop.ini
+.DS_Store
