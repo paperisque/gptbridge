@@ -7,10 +7,10 @@ namespace VoiceBridge;
 /// Ctrl+Win, который RegisterHotKey не умеет (ему нужна обычная клавиша).
 ///
 /// Жест распознаётся на ОТПУСКАНИИ: пока зажаты Ctrl+Win, следим, не нажата ли
-/// Y (вариант «+Y» — оставить текст в буфере) и не нажата ли посторонняя клавиша
-/// (тогда это системный шорткат вроде Ctrl+Win+D — игнорируем). Ничего не
-/// «глотаем»: всегда возвращаем CallNextHookEx, поэтому Пуск и системные
-/// Ctrl+Win+* работают как обычно.
+/// клавиша «+буфер» (по СКАН-КОДУ, чтобы не зависеть от раскладки — вариант
+/// «оставить текст в буфере») и не нажата ли посторонняя клавиша (тогда это
+/// системный шорткат вроде Ctrl+Win+D — игнорируем). Ничего не «глотаем»: всегда
+/// возвращаем CallNextHookEx, поэтому Пуск и системные Ctrl+Win+* работают как обычно.
 ///
 /// Колбэк хука исполняется на потоке, установившем хук (наш цикл сообщений).
 /// Внутри колбэка нельзя залипать (у LL-хука есть таймаут), поэтому мы лишь
@@ -72,11 +72,8 @@ internal sealed class KeyboardHook : IDisposable
         {
             // Ловим по СКАН-КОДУ (позиция клавиши), а не по vkCode: vkCode зависит
             // от раскладки (DE→0x59, RU→0x5A), скан-код одинаков (0x2C).
-            bool keepBuffer = scan == Native.SCAN_KEEPBUFFER;
-            if (keepBuffer) _yPressed = true;
+            if (scan == Native.SCAN_KEEPBUFFER) _yPressed = true;
             else _otherPressed = true;
-            // ДИАГНОСТИКА: что хук увидел во время зажатых Ctrl+Win.
-            Log.Info($"[hook] клавиша во время Ctrl+Win: scan=0x{scan:X2} vk=0x{vk:X2} -> {(keepBuffer ? "+буфер" : "ПОСТОРОННЯЯ (жест отменится)")}.");
         }
 
         if (_ctrlDown && _winDown && !_armed)
@@ -84,7 +81,6 @@ internal sealed class KeyboardHook : IDisposable
             _armed = true;
             _yPressed = false;
             _otherPressed = false;
-            Log.Info("[hook] Ctrl+Win зажаты — жест начат.");
         }
     }
 
@@ -93,16 +89,12 @@ internal sealed class KeyboardHook : IDisposable
         bool breaking = IsCtrl(vk) || IsWin(vk);
         if (_armed && breaking)
         {
-            // Комбо распадается — оцениваем жест.
+            // Комбо распадается — тоггл только если не было посторонней клавиши.
+            // _yPressed => вариант «+буфер» (Ctrl+Win+«Y»).
             if (!_otherPressed)
             {
                 IntPtr withY = _yPressed ? new IntPtr(1) : IntPtr.Zero;
-                Log.Info($"[hook] комбо отпущено -> ТОГГЛ (withY={_yPressed}).");
                 Native.PostThreadMessage(_targetThreadId, Native.WM_APP_TOGGLE, withY, IntPtr.Zero);
-            }
-            else
-            {
-                Log.Warn("[hook] комбо отпущено, но была посторонняя клавиша -> жест ОТМЕНЁН (тоггла нет).");
             }
             _armed = false;
         }

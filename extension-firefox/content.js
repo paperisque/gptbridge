@@ -99,78 +99,30 @@
     ) || null;
   }
 
-  // Короткое описание элемента для лога (тег, aria-label, видимость, disabled).
-  function describeEl(el) {
-    if (!el) return "(null)";
-    const r = el.getBoundingClientRect();
-    return {
-      tag: el.tagName,
-      isButton: el.tagName === "BUTTON",
-      ariaLabel: el.getAttribute && el.getAttribute("aria-label"),
-      disabled: el.disabled,
-      ariaDisabled: el.getAttribute && el.getAttribute("aria-disabled"),
-      // offsetParent == null => элемент скрыт (display:none у него/предка)
-      visible: el.offsetParent !== null && r.width > 0 && r.height > 0,
-      rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
-    };
-  }
-
   // kind: "Start" | "Submit" | "Cancel" (как в aria-label "... dictation")
   function findDictationButton(kind) {
-    const form = findComposerForm();
-    const root = form || document;
+    const root = findComposerForm() || document;
     const exact = `${kind} dictation`;
-
-    // Диагностика: все кнопки про диктовку, что вообще есть в DOM сейчас.
-    const allDict = [...document.querySelectorAll("button[aria-label]")].filter((b) =>
-      /dictation|диктов/i.test(b.getAttribute("aria-label") || "")
-    );
-    console.log(
-      `[Gptgraber] поиск "${exact}": форма ${form ? "найдена" : "НЕ найдена"}, ` +
-        `кнопок диктовки в DOM: ${allDict.length}`,
-      allDict.map((b) => b.getAttribute("aria-label"))
-    );
-
-    const inForm = root.querySelector(`button[aria-label="${exact}"]`);
-    if (inForm) {
-      console.log(`[Gptgraber] "${exact}" найдена точным селектором (в форме):`, inForm, describeEl(inForm));
-      return inForm;
-    }
-    const inDoc = document.querySelector(`button[aria-label="${exact}"]`);
-    if (inDoc) {
-      console.log(`[Gptgraber] "${exact}" найдена точным селектором (в документе):`, inDoc, describeEl(inDoc));
-      return inDoc;
-    }
+    const btn =
+      root.querySelector(`button[aria-label="${exact}"]`) ||
+      document.querySelector(`button[aria-label="${exact}"]`);
+    if (btn) return btn;
     // Фолбэк на случай иной формулировки/локали: кнопка про диктовку с нужным словом.
-    const fb =
-      allDict.find((b) => new RegExp(kind, "i").test(b.getAttribute("aria-label"))) || null;
-    if (fb) {
-      console.warn(`[Gptgraber] "${exact}" найдена ФОЛБЭКОМ по подстроке:`, fb, describeEl(fb));
-    } else {
-      console.warn(`[Gptgraber] "${exact}" НЕ найдена ни точным селектором, ни фолбэком.`);
-    }
-    return fb;
+    return (
+      [...document.querySelectorAll("button[aria-label]")].find((b) => {
+        const a = b.getAttribute("aria-label") || "";
+        return /dictation|диктов/i.test(a) && new RegExp(kind, "i").test(a);
+      }) || null
+    );
   }
 
   function clickDictation(kind, human) {
     const btn = findDictationButton(kind);
-    if (!btn) {
-      console.warn(`[Gptgraber] ${human}: кнопка "${kind} dictation" НЕ НАЙДЕНА — клик пропущен.`);
-      return;
-    }
-    const info = describeEl(btn);
-    console.log(`[Gptgraber] ${human}: дёргаю .click() по элементу:`, btn, info);
-    if (info.disabled || info.ariaDisabled === "true") {
-      console.warn(`[Gptgraber] ${human}: ВНИМАНИЕ — кнопка disabled, клик может не сработать.`);
-    }
-    if (!info.visible) {
-      console.warn(`[Gptgraber] ${human}: ВНИМАНИЕ — кнопка невидима (offsetParent=null/нулевой размер).`);
-    }
-    try {
+    if (btn) {
       btn.click();
-      console.log(`[Gptgraber] ${human}: .click() выполнен по "${kind} dictation".`);
-    } catch (e) {
-      console.error(`[Gptgraber] ${human}: .click() бросил исключение:`, e);
+      console.log(`[Gptgraber] ${human}: клик по "${kind} dictation".`);
+    } else {
+      console.warn(`[Gptgraber] ${human}: кнопка "${kind} dictation" не найдена.`);
     }
   }
 
