@@ -5,10 +5,18 @@ using System.Text.Json;
 
 namespace VoiceBridge;
 
+/// <summary>Роль WS-соединения. Сервер — хаб: один движок диктовки (Firefox) и
+/// сколько угодно контроллеров (локальный — в самом сервере, сетевые — по WS).</summary>
+internal enum ConnectionRole { Unknown, Firefox, Controller }
+
 /// <summary>
-/// WebSocket-сервер на localhost поверх HttpListener (http.sys).
-/// Принимает текст от расширения, отвечает ack/hello. Двунаправленный.
-/// Контракт сообщений — docs/PROTOCOL.md.
+/// WebSocket-сервер поверх HttpListener (http.sys). Хаб между Firefox-расширением
+/// (движок диктовки) и сетевыми клиентами-контроллерами. Двунаправленный.
+/// Контракт сообщений и роли — docs/PROTOCOL.md.
+///
+/// mic/stop/clear шлём адресно расширению (SendToFirefox), текст диктовки —
+/// конкретному контроллеру (SendToController) по его Id. Локальный контроллер
+/// живёт в ServerApp и по WS не ходит — он «владелец Id=0».
 /// </summary>
 internal sealed class WsServer
 {
@@ -20,12 +28,19 @@ internal sealed class WsServer
 
     private readonly List<ClientConnection> _clients = new();
     private readonly object _clientsLock = new();
+    private int _nextId; // Id соединений; Interlocked, начинается с 1 (0 зарезервирован под локальный контроллер)
 
     /// <summary>Вызывается (на потоке WS) после сохранения пришедшего текста.</summary>
     public Action? TextReceived { get; set; }
 
     /// <summary>Вызывается (на потоке WS), когда расширение сообщило «запись пошла».</summary>
     public Action? RecordingStarted { get; set; }
+
+    /// <summary>Вызывается (на потоке WS), когда сетевой клиент (его Id) просит СТАРТ диктовки.</summary>
+    public Action<int>? ControllerStartRequested { get; set; }
+
+    /// <summary>Вызывается (на потоке WS), когда сетевой клиент (его Id) просит СТОП диктовки.</summary>
+    public Action<int>? ControllerStopRequested { get; set; }
 
     public async Task RunAsync(CancellationToken ct)
     {
@@ -74,22 +89,38 @@ internal sealed class WsServer
     }
 
     /// <summary>
-    /// Разослать сообщение всем подключённым клиентам (fire-and-forget).
-    /// Безопасно вызывать из потока цикла сообщений — отправка уходит в фон.
+    /// Команда движку диктовки (mic/stop/clear) — всем соединениям, кроме контроллеров
+    /// (т.е. Firefox-расширению; ещё не представившиеся Unknown тоже получают — FF мог
+    /// не успеть прислать hello). Fire-and-forget; безопасно из потока цикла сообщений.
     /// </summary>
-    public void Broadcast(WsMessage msg)
+    public void SendToFirefox(WsMessage msg)
     {
         ClientConnection[] snapshot;
-        lock (_clientsLock) snapshot = _clients.ToArray();
+        lock (_clientsLock)
+            snapshot = _clients.Where(c => c.Role != ConnectionRole.Controller).ToArray();
 
         if (snapshot.Length == 0)
         {
-            Log.Warn($"Некому слать '{msg.Type}': расширение не подключено.");
+            Log.Warn($"Некому слать '{msg.Type}': расширение Firefox не подключено.");
             return;
         }
 
         foreach (var client in snapshot)
             _ = SendAsync(client, msg, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Текст диктовки конкретному сетевому клиенту по его Id (fire-and-forget).
+    /// Возвращает false, если такого соединения уже нет (клиент отключился).
+    /// </summary>
+    public bool SendToController(int id, WsMessage msg)
+    {
+        ClientConnection? client;
+        lock (_clientsLock) client = _clients.FirstOrDefault(c => c.Id == id);
+        if (client is null) return false;
+
+        _ = SendAsync(client, msg, CancellationToken.None);
+        return true;
     }
 
     private async Task HandleClientAsync(HttpListenerContext ctx, CancellationToken ct)
@@ -106,9 +137,10 @@ internal sealed class WsServer
             return;
         }
 
-        var client = new ClientConnection(socket);
+        int id = Interlocked.Increment(ref _nextId);
+        var client = new ClientConnection(socket, id);
         lock (_clientsLock) _clients.Add(client);
-        Log.Ok($"Расширение подключилось ({ctx.Request.RemoteEndPoint}).");
+        Log.Ok($"Клиент #{id} подключился ({ctx.Request.RemoteEndPoint}) — роль определится по hello.");
 
         await SendAsync(client, new WsMessage { Type = "hello", Payload = "VoiceBridge ready" }, ct);
 
@@ -138,13 +170,13 @@ internal sealed class WsServer
             }
         }
         catch (OperationCanceledException) { }
-        catch (WebSocketException ex) { Log.Warn($"WS-соединение разорвано: {ex.Message}"); }
-        catch (Exception ex) { Log.Error($"Ошибка чтения WS: {ex.Message}"); }
+        catch (WebSocketException ex) { Log.Warn($"WS-соединение #{client.Id} разорвано: {ex.Message}"); }
+        catch (Exception ex) { Log.Error($"Ошибка чтения WS #{client.Id}: {ex.Message}"); }
         finally
         {
             lock (_clientsLock) _clients.Remove(client);
             client.Dispose();
-            Log.Info("Расширение отключилось.");
+            Log.Info($"Клиент #{client.Id} ({client.Role}) отключился.");
         }
     }
 
@@ -178,7 +210,22 @@ internal sealed class WsServer
                 break;
 
             case "hello":
-                Log.Info($"Расширение представилось: {Preview(msg.Payload)}");
+                // Роль по payload: "controller" → сетевой клиент, иначе движок диктовки (Firefox).
+                client.Role = msg.Payload.Contains("controller", StringComparison.OrdinalIgnoreCase)
+                    ? ConnectionRole.Controller
+                    : ConnectionRole.Firefox;
+                Log.Info($"Клиент #{client.Id} представился ({client.Role}): {Preview(msg.Payload)}");
+                break;
+
+            case "start":
+                // Сетевой клиент просит старт диктовки. Тяжёлую работу делает ServerApp на своём потоке.
+                Log.Info($"Сетевой клиент #{client.Id}: запрос СТАРТ.");
+                ControllerStartRequested?.Invoke(client.Id);
+                break;
+
+            case "stop":
+                Log.Info($"Сетевой клиент #{client.Id}: запрос СТОП.");
+                ControllerStopRequested?.Invoke(client.Id);
                 break;
 
             default:
@@ -209,13 +256,19 @@ internal sealed class WsServer
     }
 }
 
-/// <summary>Одно WS-соединение + его лок на отправку.</summary>
+/// <summary>Одно WS-соединение: Id, роль (Firefox/контроллер) и лок на отправку.</summary>
 internal sealed class ClientConnection : IDisposable
 {
     public WebSocket Socket { get; }
+    public int Id { get; }
+    public ConnectionRole Role { get; set; } = ConnectionRole.Unknown;
     public SemaphoreSlim SendLock { get; } = new(1, 1);
 
-    public ClientConnection(WebSocket socket) => Socket = socket;
+    public ClientConnection(WebSocket socket, int id)
+    {
+        Socket = socket;
+        Id = id;
+    }
 
     public void Dispose()
     {

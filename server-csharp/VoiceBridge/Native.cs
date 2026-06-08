@@ -15,6 +15,8 @@ internal static class Native
     public const uint WM_APP_TOGGLE = 0x8000 + 1; // от хука: тоггл диктовки (wParam=1 => вариант +Y)
     public const uint WM_APP_INJECT = 0x8000 + 2; // от потока WS: пришёл текст, пора вставлять
     public const uint WM_APP_FOCUS_BACK = 0x8000 + 3; // от потока WS/таймера: запись пошла, вернуть фокус в рабочее окно
+    public const uint WM_APP_CTRL_START = 0x8000 + 4; // от потока WS: сетевой клиент (wParam=Id) просит старт диктовки
+    public const uint WM_APP_CTRL_STOP = 0x8000 + 5;  // от потока WS: сетевой клиент (wParam=Id) просит стоп диктовки
 
     // ---- Низкоуровневый хук клавиатуры ----
     public const int WH_KEYBOARD_LL = 13;

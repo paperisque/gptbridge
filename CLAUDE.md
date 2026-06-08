@@ -20,6 +20,8 @@
 
 **Вставка не крадёт фокус по сути:** пользователь и так в целевом окне, вставка = Ctrl+V в уже активное окно. `Injector.ForceForeground` (вынос окна на передний план через `AttachThreadInput`) используется и для подъёма Firefox на старте, и как гарантия, что цель на переднем плане перед Ctrl+V.
 
+**Сетевой режим (хаб) — расширение модели, не замена.** Сервер сам по себе остаётся полноценной конечной точкой: запущенный без аргументов `VoiceBridge` ловит локальный Ctrl+Win и вставляет на этой же машине, как раньше (это «локальный контроллер» внутри `ServerApp`, владелец `Id=0`). Поверх него сервер — это **хаб**: один Firefox-движок диктовки и сколько угодно **контроллеров**. Сетевой клиент (`VoiceBridge --connect <IP>` на другой машине, `ClientApp`+`WsClient`) ловит свой Ctrl+Win, по СТОПу захватывает **своё** активное окно и шлёт серверу `start`/`stop`; сервер гоняет тот же Firefox, а распознанный текст возвращает **владельцу сессии** — тому, кто её запустил (`inject` по WS → клиент вставляет у себя). Диктовка одна на один Firefox: пока идёт сессия одного владельца, старты других игнорируются («занято»). Трюк §6.11 (подъём окна FF, возврат фокуса) всегда выполняет сервер — окно FF на машине-сервере; для удалённой сессии захват окна-цели и сам Ctrl+V происходят на машине клиента. Защиты/токена нет — рассчитано на доверенную локальную сеть.
+
 ## 3. Структура репозитория
 
 ```
@@ -28,17 +30,20 @@ Gptgraber/
 ├─ README.md                 обзор для человека
 ├─ .gitignore                bin/ obj/ .vs/
 ├─ docs/PROTOCOL.md          контракт WS (источник правды по сообщениям)
-├─ server-csharp/VoiceBridge/  C#-сервер (.NET 10, net10.0-windows, console)
-│  ├─ Program.cs             entry point, цикл сообщений Win32, машина состояний Idle/Recording, возврат фокуса
-│  ├─ KeyboardHook.cs        WH_KEYBOARD_LL: тоггл Ctrl+Win / Ctrl+Win+«Y» (по скан-коду)
-│  ├─ WsServer.cs            HttpListener + WebSocket; приём/ack/broadcast; колбэки TextReceived / RecordingStarted
+├─ server-csharp/VoiceBridge/  C#-приложение (.NET 10, net10.0-windows, console) — один exe, два режима
+│  ├─ Program.cs             entry point + разбор аргументов: режим сервера (по умолч.) или клиента (--connect)
+│  ├─ ServerApp.cs           режим СЕРВЕРА (хаб): цикл сообщений Win32, локальный контроллер, владелец сессии, маршрутизация текста
+│  ├─ ClientApp.cs           режим СЕТЕВОГО КЛИЕНТА: хук + захват своего окна + вставка по inject (Firefox тут нет)
+│  ├─ KeyboardHook.cs        WH_KEYBOARD_LL: тоггл Ctrl+Win / Ctrl+Win+«Y» (по скан-коду); общий для обоих режимов
+│  ├─ WsServer.cs            HttpListener + WebSocket (хаб): роли соединений, SendToFirefox/SendToController, колбэки start/stop/text/recording
+│  ├─ WsClient.cs            ClientWebSocket с реконнектом (режим клиента): шлёт start/stop, принимает inject
 │  ├─ WindowFinder.cs        поиск окна Firefox (MozillaWindowClass + заголовок «ChatGPT») для подъёма на старте
-│  ├─ Injector.cs            вставка: буфер + ForceForeground(AttachThreadInput) + SendInput(Ctrl+V скан-коды)
+│  ├─ Injector.cs            вставка: буфер + ForceForeground(AttachThreadInput) + SendInput(Ctrl+V скан-коды); общий
 │  ├─ Clipboard.cs           Win32-буфер (CF_UNICODETEXT), save/restore, без WinForms
-│  ├─ Native.cs              все P/Invoke, структуры, константы
+│  ├─ Native.cs              все P/Invoke, структуры, константы (+ WM_APP_CTRL_START/STOP)
 │  ├─ SharedState.cs         TargetHwnd + LastText (LastText под локом)
 │  ├─ WsMessage.cs           конверт {type, payload}
-│  ├─ Config.cs              WsPrefix (порт 17890), тайминги
+│  ├─ Config.cs              Host/Port (по умолч. localhost:17890), WsPrefix/WsClientUrl, тайминги, реконнект
 │  └─ Log.cs                 цветной консольный лог
 └─ extension-firefox/        расширение (MV2, persistent background)
    ├─ manifest.json          permissions: ws://localhost:17890/*; matches: chatgpt.com / chat.openai.com
@@ -57,16 +62,27 @@ dotnet run        # запуск (или в Visual Studio: F5)
 ```
 Окно консоли = сервер; держать открытым. Ctrl+C — выход. Порт `http://localhost:17890/` обычно открывается без админ-прав; если отказ — `netsh http add urlacl url=http://localhost:17890/ user=ДОМЕН\Пользователь`.
 
+**Режимы запуска** (`--help` печатает справку). Запуск — через `dotnet run -- <аргументы>` или `dotnet bin\Debug\net10.0-windows\VoiceBridge.dll <аргументы>`. Свой `.exe` НЕ собираем (`UseAppHost=false`, см. §6.14 — SAC), поэтому всегда через `dotnet`:
+```powershell
+dotnet run                            # сервер на localhost:17890 (как раньше)
+dotnet run -- --host +                # сервер слушает все интерфейсы (доступ по сети)
+dotnet run -- --connect 192.168.1.50  # сетевой клиент к серверу-хабу (порт по умолч. 17890)
+dotnet run -- --port 18000            # сменить порт (общий флаг для обоих режимов)
+```
+Для сетевого сервера разово (админ-консоль): `netsh http add urlacl url=http://+:17890/ user=ДОМЕН\Пользователь` и правило брандмауэра на входящий TCP 17890. На машине сетевого клиента Firefox/расширение НЕ нужны — только .NET-рантайм и эта DLL.
+
 **Расширение** (Firefox Dev): `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → `extension-firefox/manifest.json`. После правок — кнопка **Reload** там же; таб ChatGPT — **Ctrl+R**. Временное дополнение слетает при перезапуске браузера.
 
 Проверка синтаксиса JS: `node --check content.js` / `background.js`.
 
 ## 5. WS-протокол (кратко; полностью — docs/PROTOCOL.md)
 
-`ws://localhost:17890/`, сообщения `{ "type": "...", "payload": "..." }`, UTF-8.
+`ws://<host>:17890/`, сообщения `{ "type": "...", "payload": "..." }`, UTF-8. Роль соединения сервер определяет по `hello`: payload со словом `controller` → сетевой клиент, иначе → Firefox.
 
-- ext → сервер: `hello`, `text` (полный innerText композера), `recording` (запись реально началась).
-- сервер → ext: `hello`, `ack`, `mic` (клик микрофона), `stop` (клик птички), `clear` (очистить композер).
+- Firefox → сервер: `hello`, `text` (полный innerText композера), `recording` (запись реально началась).
+- сервер → Firefox: `hello`, `ack`, `mic` (клик микрофона), `stop` (клик птички), `clear` (очистить композер). Адресно — `SendToFirefox`.
+- сетевой клиент → сервер: `hello` (`"controller"`), `start`, `stop`.
+- сервер → сетевой клиент: `hello`, `inject` (текст диктовки владельцу сессии). Адресно — `SendToController` по Id соединения.
 
 ## 6. Ключевые технические решения и ГРАБЛИ (не наступать повторно)
 
@@ -87,7 +103,7 @@ dotnet run        # запуск (или в Visual Studio: F5)
 
 5. **Низкоуровневый хук должен быть быстрым.** В колбэке `KeyboardHook.HookProc` НЕЛЬЗЯ залипать (таймаут LL-хука) — только `PostThreadMessage` себе в очередь; тяжёлую работу делает цикл сообщений. Делегат хука хранится в поле (иначе GC съест). Хук ставится на главном потоке (у него цикл сообщений).
 
-6. **Тяжёлая работа — на потоке цикла сообщений.** И хоткей-хук, и приходящие по WS события (`text`, `recording`) маршалятся в главный поток (`WM_APP_TOGGLE`, `WM_APP_INJECT`, `WM_APP_FOCUS_BACK` через `PostThreadMessage`). У этого потока есть очередь ввода — важно для `AttachThreadInput`. Сам WS-сервер живёт в фоне.
+6. **Тяжёлая работа — на потоке цикла сообщений.** И хоткей-хук, и приходящие по WS события (`text`, `recording`, а также `start`/`stop` от сетевых клиентов) маршалятся в главный поток (`WM_APP_TOGGLE`, `WM_APP_INJECT`, `WM_APP_FOCUS_BACK`, `WM_APP_CTRL_START/STOP` через `PostThreadMessage`). У этого потока есть очередь ввода — важно для `AttachThreadInput`. Сам WS-сервер живёт в фоне. Id сетевого клиента (для маршрутизации текста обратно) передаётся через `wParam` сообщения — не управляемый объект, а int, поэтому проходит через `PostThreadMessage` без проблем; машина состояний (`_state`/`_ownerId`) трогается только этим потоком.
 
 7. **Гейт авто-вставки.** Сервер вставляет текст только если `_pendingInject` (выставляется на СТОПе). Чужие/случайные изменения композера не вставляются.
 
@@ -101,11 +117,15 @@ dotnet run        # запуск (или в Visual Studio: F5)
 
 12. **Хоткей-клавиша — по скан-коду, не по vkCode.** `vkCode` зависит от раскладки: одна и та же физическая клавиша на немецкой раскладке = `VK_Y` (0x59), на русской = `VK_Z` (0x5A). Скан-код аппаратной позиции одинаков всегда. Поэтому клавиша «+буфер» ловится по `scanCode == 0x2C` (`Native.SCAN_KEEPBUFFER`), а модификаторы Ctrl/Win — по vk (они от раскладки не зависят).
 
+13. **Хаб: роли, владелец сессии, единственный ресурс.** Сервер различает соединения по `hello` (`controller` → сетевой клиент, иначе Firefox) и шлёт адресно: `mic/stop/clear` — только Firefox-соединениям (`SendToFirefox`), `inject` — конкретному клиенту (`SendToController` по `Id`). НЕ возвращать `Broadcast` (рассылал бы команды диктовки и контроллерам). Диктовка — один общий Firefox: `_ownerId` фиксируется на СТАРТЕ, текст уходит этому владельцу; пока `Recording`, чужие старты игнорируются. `_pendingInject` сбрасывается на старте (страховка от «зависшего» прошлого СТОПа). Окно-цель и буфер для удалённого владельца — забота клиента (он захватывает своё окно по `stop` и вставляет у себя); сервер удалённый HWND не знает. Доступ по сети к `http://+:17890/` требует разового `netsh http add urlacl` (или запуска от админа) и правила брандмауэра — иначе `HttpListener` бросит «отказ доступа».
+
+14. **Smart App Control (SAC) блокирует неподписанный apphost.** На Windows 11 с включённым SAC свежесобранный `VoiceBridge.exe` (apphost) не запускается («Application control policy has blocked this file») — и `dotnet run` тоже, т.к. он запускает этот exe. SAC доверяет только подписанным/репутационным бинарям, отдельных исключений не даёт, а выключается необратимо (до переустановки Windows). Обход без отключения SAC: `UseAppHost=false` в csproj — exe не генерируется, запуск идёт через доверенный `dotnet.exe` (`dotnet run` / `dotnet <dll>`). Не возвращать apphost, пока проект не подписывается. На клиентских машинах с SAC — так же: нужен .NET-рантайм и запуск DLL через `dotnet`.
+
 ## 7. Конвенции
 
 - .NET 10, `net10.0-windows`, console, Nullable enable, ImplicitUsings.
-- Имя exe/сборки — `VoiceBridge`. Имя проекта — `Gptgraber`.
+- Имя сборки — `VoiceBridge` (запуск через `dotnet`, apphost не собираем — см. §6.14). Имя проекта — `Gptgraber`.
 - Комментарии и логи — на русском.
-- Контракт WS меняем ТОЛЬКО синхронно: `docs/PROTOCOL.md` + `WsServer.OnMessageAsync` + обработчики в `content.js`/`background.js`.
+- Контракт WS меняем ТОЛЬКО синхронно: `docs/PROTOCOL.md` + `WsServer.OnMessageAsync` + `WsClient.OnMessage` + обработчики в `content.js`/`background.js`.
 - Проверять после изменений: `dotnet build` для C#, `node --check` для JS.
 - В гит не коммитим `bin/`, `obj/`, `.vs/` (см. `.gitignore`).
