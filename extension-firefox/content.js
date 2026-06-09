@@ -169,6 +169,15 @@
     else if (msg.type === "clear") clearComposer();
   });
 
+  // Регистрируемся в background: сообщаем, что в этом табе живёт ChatGPT, чтобы
+  // перед стартом диктовки background мог активировать ИМЕННО этот таб. Firefox не
+  // начинает захват микрофона в фоновом (невыбранном) табе — активный таб обязателен
+  // (см. §6.15; §6.11 — про окно, это про таб внутри окна). Сам id таба background
+  // берёт из sender этого сообщения, поэтому payload не нужен.
+  browser.runtime
+    .sendMessage({ type: "register" })
+    .catch((err) => console.warn("[Gptgraber] sendMessage(register):", err));
+
   setInterval(tick, POLL_MS);
   console.log(`[Gptgraber] опрашиваю композер раз в ${POLL_MS} мс.`);
 })();
