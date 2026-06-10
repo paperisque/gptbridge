@@ -12,7 +12,9 @@
   },
 
   "permissions": [
-    "ws://localhost:17890/*"
+    "ws://localhost:17890/*",
+    "*://chatgpt.com/*",
+    "*://chat.openai.com/*"
   ],
 
   "content_scripts": [

@@ -11,7 +11,7 @@ internal static class Log
         {
             var prev = Console.ForegroundColor;
             Console.ForegroundColor = color;
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {level} {msg}");
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {level} {msg}");
             Console.ForegroundColor = prev;
         }
     }

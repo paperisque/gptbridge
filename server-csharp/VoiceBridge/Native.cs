@@ -17,6 +17,8 @@ internal static class Native
     public const uint WM_APP_FOCUS_BACK = 0x8000 + 3; // от потока WS/таймера: запись пошла, вернуть фокус в рабочее окно
     public const uint WM_APP_CTRL_START = 0x8000 + 4; // от потока WS: сетевой клиент (wParam=Id) просит старт диктовки
     public const uint WM_APP_CTRL_STOP = 0x8000 + 5;  // от потока WS: сетевой клиент (wParam=Id) просит стоп диктовки
+    public const uint WM_APP_READY = 0x8000 + 6;      // от потока WS: расширение сообщило, что таб ChatGPT готов к диктовке
+    public const uint WM_APP_PREPARE_TIMEOUT = 0x8000 + 7; // от таймера: не дождались готовности ChatGPT — отменить старт
 
     // ---- Низкоуровневый хук клавиатуры ----
     public const int WH_KEYBOARD_LL = 13;

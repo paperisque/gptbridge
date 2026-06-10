@@ -42,6 +42,18 @@ internal sealed class WsServer
     /// <summary>Вызывается (на потоке WS), когда сетевой клиент (его Id) просит СТОП диктовки.</summary>
     public Action<int>? ControllerStopRequested { get; set; }
 
+    /// <summary>Вызывается (на потоке WS), когда расширение Firefox представилось (hello, роль Firefox).</summary>
+    public Action? FirefoxConnected { get; set; }
+
+    /// <summary>Вызывается (на потоке WS), когда расширение сообщило «таб ChatGPT готов к диктовке» (ready).</summary>
+    public Action? ReadyReceived { get; set; }
+
+    /// <summary>Есть ли подключённое расширение Firefox (движок диктовки на связи).</summary>
+    public bool HasFirefox
+    {
+        get { lock (_clientsLock) return _clients.Any(c => c.Role == ConnectionRole.Firefox); }
+    }
+
     public async Task RunAsync(CancellationToken ct)
     {
         var listener = new HttpListener();
@@ -209,12 +221,19 @@ internal sealed class WsServer
                 RecordingStarted?.Invoke();
                 break;
 
+            case "ready":
+                // Расширение: таб ChatGPT загружен, кнопка «Start dictation» доступна.
+                Log.Info("Расширение: таб ChatGPT готов к диктовке.");
+                ReadyReceived?.Invoke();
+                break;
+
             case "hello":
                 // Роль по payload: "controller" → сетевой клиент, иначе движок диктовки (Firefox).
                 client.Role = msg.Payload.Contains("controller", StringComparison.OrdinalIgnoreCase)
                     ? ConnectionRole.Controller
                     : ConnectionRole.Firefox;
                 Log.Info($"Клиент #{client.Id} представился ({client.Role}): {Preview(msg.Payload)}");
+                if (client.Role == ConnectionRole.Firefox) FirefoxConnected?.Invoke();
                 break;
 
             case "start":

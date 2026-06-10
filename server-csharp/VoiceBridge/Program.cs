@@ -55,6 +55,9 @@ internal static class Program
                 case "--host":
                     listenHost = NextValue(args, ref i);
                     break;
+                case "--no-autolaunch":
+                    Config.AutoLaunchFirefox = false;
+                    break;
                 case "--port":
                     string p = NextValue(args, ref i);
                     if (!int.TryParse(p, out int pv) || pv < 1 || pv > 65535)
@@ -93,8 +96,10 @@ internal static class Program
     private static void PrintUsage()
     {
         Log.Info("Использование:");
-        Log.Info("  VoiceBridge [--host <addr>] [--port <n>]    режим сервера (хаб); по умолчанию localhost:17890.");
-        Log.Info("  VoiceBridge --connect <host> [--port <n>]   режим сетевого клиента к серверу-хабу.");
+        Log.Info("  VoiceBridge [--host <addr>] [--port <n>] [--no-autolaunch]   режим сервера (хаб); по умолчанию localhost:17890.");
+        Log.Info("  VoiceBridge --connect <host> [--port <n>]                    режим сетевого клиента к серверу-хабу.");
+        Log.Info("");
+        Log.Info("  --no-autolaunch  не поднимать Firefox автоматически (по умолчанию сервер сам запускает FF с ChatGPT).");
         Log.Info("");
         Log.Info("Примеры:");
         Log.Info("  VoiceBridge                          локально на этой машине (как раньше).");

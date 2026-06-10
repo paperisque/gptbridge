@@ -11,6 +11,12 @@
 .idea/
 *.swp
 
+# ---- Node / web-ext (сборка и подпись расширения) ----
+node_modules/
+dist/
+web-ext-artifacts/
+*.xpi
+
 # ---- OS ----
 Thumbs.db
 desktop.ini

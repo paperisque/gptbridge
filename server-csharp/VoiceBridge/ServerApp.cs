@@ -24,9 +24,11 @@ namespace VoiceBridge;
 /// </summary>
 internal static class ServerApp
 {
-    private enum DictState { Idle, Recording }
+    // Idle — простой; Preparing — готовим Firefox/таб ChatGPT, ждём «ready»; Recording — идёт запись.
+    private enum DictState { Idle, Preparing, Recording }
 
     private const int LocalOwner = 0; // владелец-локальный контроллер (Id сетевых клиентов начинаются с 1)
+    private const int NoOwner = -1;   // нет отложенного старта
 
     private static uint _mainThreadId;
     private static WsServer _server = null!;
@@ -41,6 +43,10 @@ internal static class ServerApp
     private static IntPtr _returnWindow;  // окно, активное до старта — вернуть фокус сюда
     private static bool _awaitingRecording; // ждём сигнал «запись пошла», чтобы вернуть фокус
     private static Timer? _focusBackTimer;  // страховка: вернуть фокус, даже если сигнала нет
+    private static long _micSentTicks;      // момент отправки mic (для минимального удержания фокуса)
+
+    private static int _pendingStartOwner = NoOwner; // владелец, для которого начнём запись по «ready»
+    private static Timer? _prepareTimer;  // страховка: не дождались «ready» — отменить старт
 
     public static void Run()
     {
@@ -57,12 +63,22 @@ internal static class ServerApp
                 Native.PostThreadMessage(_mainThreadId, Native.WM_APP_CTRL_START, new IntPtr(id), IntPtr.Zero),
             ControllerStopRequested = id =>
                 Native.PostThreadMessage(_mainThreadId, Native.WM_APP_CTRL_STOP, new IntPtr(id), IntPtr.Zero),
+            // Расширение подключилось — прогреваем таб ChatGPT (ensureTab); это же
+            // двигает отложенный старт, если мы ждали поднятия Firefox.
+            FirefoxConnected = OnFirefoxConnected,
+            ReadyReceived = () =>
+                Native.PostThreadMessage(_mainThreadId, Native.WM_APP_READY, IntPtr.Zero, IntPtr.Zero),
         };
         _ = _server.RunAsync(cts.Token);
 
         // 2. Хук клавиатуры на ЭТОМ потоке (он же крутит GetMessage) — локальный контроллер.
         _hook = new KeyboardHook(_mainThreadId);
         _hook.Install();
+
+        // 2a. Прогрев Firefox на старте сервера: если FF не запущен — поднять его с
+        // табом ChatGPT (без записи). Если запущен — таб подготовит расширение, как
+        // только подключится (OnFirefoxConnected → ensureTab).
+        PrepareFirefoxAtStartup();
 
         Console.CancelKeyPress += (_, e) =>
         {
@@ -90,6 +106,12 @@ internal static class ServerApp
                 case Native.WM_APP_CTRL_STOP:
                     HandleCtrlStop((int)msg.wParam.ToInt64());
                     break;
+                case Native.WM_APP_READY:
+                    HandleReady();
+                    break;
+                case Native.WM_APP_PREPARE_TIMEOUT:
+                    HandlePrepareTimeout();
+                    break;
             }
 
             Native.TranslateMessage(ref msg);
@@ -107,7 +129,11 @@ internal static class ServerApp
     {
         if (_state == DictState.Idle)
         {
-            BeginRecording(LocalOwner);
+            RequestStart(LocalOwner);
+        }
+        else if (_state == DictState.Preparing)
+        {
+            Log.Warn("Готовлю ChatGPT — секунду, нажми ещё раз чуть позже.");
         }
         else if (_ownerId == LocalOwner)
         {
@@ -131,14 +157,23 @@ internal static class ServerApp
     private static void HandleCtrlStart(int id)
     {
         if (_state == DictState.Idle)
-            BeginRecording(id);
+            RequestStart(id);
         else
-            Log.Warn($"Старт сетевого клиента #{id} проигнорирован — занято (владелец {OwnerLabel(_ownerId)}).");
+            Log.Warn($"Старт сетевого клиента #{id} проигнорирован — занято (владелец {OwnerLabel(_ownerId)}, состояние {_state}).");
     }
 
     /// <summary>Сетевой клиент просит СТОП. На потоке цикла сообщений.</summary>
     private static void HandleCtrlStop(int id)
     {
+        // Клиент передумал, пока мы ещё готовили ChatGPT под его старт — отменяем подготовку.
+        if (_state == DictState.Preparing && _pendingStartOwner == id)
+        {
+            CancelPrepare();
+            _state = DictState.Idle;
+            Log.Info($"Сетевой клиент #{id} отменил старт во время подготовки.");
+            return;
+        }
+
         if (_state != DictState.Recording || _ownerId != id)
         {
             Log.Warn($"Стоп сетевого клиента #{id} проигнорирован (он не владелец текущей сессии).");
@@ -155,25 +190,138 @@ internal static class ServerApp
     }
 
     /// <summary>
+    /// Запрос старта (Idle → Preparing). Сначала убеждаемся, что Firefox с табом
+    /// ChatGPT готов: если расширение на связи — просим открыть/проверить таб
+    /// (ensureTab); если Firefox не запущен — поднимаем его. Сама запись начнётся в
+    /// HandleReady, когда придёт «ready». Окно для возврата фокуса запоминаем СЕЙЧАС —
+    /// пока пользователь ещё в своём рабочем окне (до манёвров с Firefox).
+    /// </summary>
+    private static void RequestStart(int ownerId)
+    {
+        _ownerId = ownerId;
+        _pendingStartOwner = ownerId;
+        _returnWindow = Native.GetForegroundWindow();
+
+        if (_server.HasFirefox)
+        {
+            // Расширение на связи — просим открыть/проверить таб ChatGPT, ждём «ready».
+            _state = DictState.Preparing;
+            _server.SendToFirefox(new WsMessage { Type = "ensureTab" });
+            ArmPrepareTimer(Config.PrepareReadyTimeoutMs);
+            Log.Ok($"▶ Старт диктовки (владелец {OwnerLabel(ownerId)}): готовлю таб ChatGPT, жду готовности…");
+        }
+        else if (FirefoxLauncher.IsRunning())
+        {
+            // FF запущен, но расширение ещё не на связи (мог только подниматься/переподключаться).
+            // Ждём: подключится → OnFirefoxConnected пришлёт ensureTab → «ready» → старт.
+            _state = DictState.Preparing;
+            ArmPrepareTimer(Config.PrepareLaunchTimeoutMs);
+            Log.Ok($"▶ Старт диктовки (владелец {OwnerLabel(ownerId)}): Firefox запущен, жду подключения расширения…");
+        }
+        else if (Config.AutoLaunchFirefox && FirefoxLauncher.Launch(Config.ChatGptUrl))
+        {
+            _state = DictState.Preparing;
+            ArmPrepareTimer(Config.PrepareLaunchTimeoutMs);
+            Log.Ok($"▶ Старт диктовки (владелец {OwnerLabel(ownerId)}): поднимаю Firefox, запись начнётся, как он будет готов…");
+        }
+        else
+        {
+            _state = DictState.Idle;
+            _pendingStartOwner = NoOwner;
+            if (!Config.AutoLaunchFirefox)
+                Log.Warn("Firefox не запущен, а авто-запуск отключён (--no-autolaunch). Открой ChatGPT в Firefox вручную.");
+            // при неудаче запуска FirefoxLauncher уже залогировал причину
+        }
+    }
+
+    /// <summary>
+    /// Пришёл «ready» — таб ChatGPT готов. Если мы ждали этого для старта — начинаем
+    /// запись. Иначе (прогрев на старте/реконнекте) просто игнорируем. На потоке цикла.
+    /// </summary>
+    private static void HandleReady()
+    {
+        if (_state != DictState.Preparing || _pendingStartOwner == NoOwner)
+            return; // просто прогрев — таб готов, старта не ждали
+
+        int owner = _pendingStartOwner;
+        _pendingStartOwner = NoOwner;
+        CancelPrepare();
+        BeginRecording(owner);
+    }
+
+    /// <summary>Не дождались «ready» за отведённый срок — отменяем старт. На потоке цикла.</summary>
+    private static void HandlePrepareTimeout()
+    {
+        if (_state != DictState.Preparing) return;
+        CancelPrepare();
+        _state = DictState.Idle;
+        _pendingStartOwner = NoOwner;
+        Log.Warn("Не дождался готовности ChatGPT (таб не открылся / расширение не ответило). Старт отменён — "
+                 + "проверь Firefox и расширение, затем повтори Ctrl+Win.");
+    }
+
+    private static void ArmPrepareTimer(int ms)
+    {
+        CancelPrepare();
+        _prepareTimer = new Timer(
+            _ => Native.PostThreadMessage(_mainThreadId, Native.WM_APP_PREPARE_TIMEOUT, IntPtr.Zero, IntPtr.Zero),
+            null, ms, Timeout.Infinite);
+    }
+
+    private static void CancelPrepare()
+    {
+        _prepareTimer?.Dispose();
+        _prepareTimer = null;
+    }
+
+    /// <summary>
+    /// Прогрев Firefox при старте сервера (без записи). FF не запущен и авто-запуск
+    /// включён → поднимаем его с табом ChatGPT. Если запущен — таб подготовит само
+    /// расширение, когда подключится (OnFirefoxConnected → ensureTab).
+    /// </summary>
+    private static void PrepareFirefoxAtStartup()
+    {
+        if (!Config.AutoLaunchFirefox) return;
+        if (FirefoxLauncher.IsRunning())
+        {
+            Log.Info("Firefox уже запущен — таб ChatGPT подготовлю, как подключится расширение.");
+            return;
+        }
+        if (FirefoxLauncher.Launch(Config.ChatGptUrl))
+            Log.Info("Прогрев: поднимаю Firefox с ChatGPT (запись не начинаю — только подготовка).");
+    }
+
+    /// <summary>
+    /// Расширение Firefox подключилось (на потоке WS). Просим подготовить таб ChatGPT.
+    /// Это же двигает отложенный старт: расширение ответит «ready», и если мы ждали
+    /// поднятия Firefox под запись — HandleReady её начнёт.
+    /// </summary>
+    private static void OnFirefoxConnected()
+    {
+        _server.SendToFirefox(new WsMessage { Type = "ensureTab" });
+    }
+
+    /// <summary>
     /// Общий старт записи для любого владельца. Firefox не начинает захват
     /// микрофона, пока его окно в фоне — выносим окно FF вперёд, потом шлём «микрофон».
-    /// Фокус на машине-сервере вернём по сигналу «recording».
+    /// Фокус на машине-сервере вернём по сигналу «recording». Вызывается из HandleReady,
+    /// когда таб ChatGPT уже готов; окно для возврата фокуса уже запомнено в RequestStart.
     /// </summary>
     private static void BeginRecording(int ownerId)
     {
         _ownerId = ownerId;
         _pendingInject = false; // на случай незавершённой прошлой сессии
-        _returnWindow = Native.GetForegroundWindow();
         _state = DictState.Recording;
 
         IntPtr ff = WindowFinder.FindFirefoxChatGpt();
         if (ff != IntPtr.Zero)
         {
             _awaitingRecording = true;
-            Injector.ForceForeground(ff);
+            bool fg = Injector.ForceForeground(ff);
+            _micSentTicks = Environment.TickCount64;
             _server.SendToFirefox(new WsMessage { Type = "mic" });
             ArmFocusBackTimer();
-            Log.Ok($"▶ Старт диктовки (владелец {OwnerLabel(ownerId)}): поднял Firefox (0x{ff.ToInt64():X}), "
+            Log.Ok($"▶ Старт диктовки (владелец {OwnerLabel(ownerId)}): поднял Firefox (0x{ff.ToInt64():X}, передний план={fg}), "
                    + $"жду старта записи, верну фокус в «{Native.GetWindowTitle(_returnWindow)}».");
         }
         else
@@ -196,14 +344,31 @@ internal static class ServerApp
     /// </summary>
     private static void HandleFocusBack()
     {
+        if (!_awaitingRecording) { CancelFocusBack(); return; } // уже вернули / не ждём
+
+        // Сигнал «recording» приходит по ПОЯВЛЕНИЮ UI диктовки (кнопка Submit), а это
+        // раньше реального включения микрофона. Если отпустить фокус сразу — захват не
+        // успеет стартовать (§6.11). Держим фокус на окне FF минимум MinFocusHoldMs с
+        // момента mic; если ещё рано — ждём остаток и выходим (вернёмся сюда по таймеру).
+        long held = Environment.TickCount64 - _micSentTicks;
+        if (held < Config.MinFocusHoldMs)
+        {
+            long remain = Config.MinFocusHoldMs - held;
+            CancelFocusBack();
+            _focusBackTimer = new Timer(
+                _ => Native.PostThreadMessage(_mainThreadId, Native.WM_APP_FOCUS_BACK, IntPtr.Zero, IntPtr.Zero),
+                null, remain, Timeout.Infinite);
+            Log.Info($"Запись отрапортована через {held} мс — держу фокус на Firefox ещё {remain} мс (захвату нужно время стартовать).");
+            return;
+        }
+
         CancelFocusBack();
-        if (!_awaitingRecording) return; // уже вернули / не ждём
         _awaitingRecording = false;
 
         if (_returnWindow != IntPtr.Zero && Native.IsWindow(_returnWindow))
         {
             Injector.ForceForeground(_returnWindow);
-            Log.Ok($"Фокус возвращён в «{Native.GetWindowTitle(_returnWindow)}».");
+            Log.Ok($"Фокус возвращён в «{Native.GetWindowTitle(_returnWindow)}» (фокус держался {held} мс).");
         }
     }
 

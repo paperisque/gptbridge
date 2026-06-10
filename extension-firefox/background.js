@@ -7,9 +7,37 @@
 
 "use strict";
 
+// Метки времени (ЧЧ:ММ:СС.мс) на ВСЕ наши логи — чтобы ловить тайминги (фокус и пр.).
+// Оборачиваем console один раз: дальше любой console.log/warn/debug печатает время первым.
+try {
+  const _ol = console.log.bind(console);
+  const _ow = console.warn.bind(console);
+  const _od = console.debug.bind(console);
+  const _ts = () => {
+    const d = new Date();
+    const p = (n, w = 2) => String(n).padStart(w, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+  };
+  console.log = (...a) => _ol(_ts(), ...a);
+  console.warn = (...a) => _ow(_ts(), ...a);
+  console.debug = (...a) => _od(_ts(), ...a);
+} catch (e) { /* консоль не патчится — не критично */ }
+
 const WS_URL = "ws://localhost:17890/";
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
+
+// Подготовка таба ChatGPT по команде ensureTab от сервера (см. §6.16).
+const CHATGPT_MATCH = ["*://chatgpt.com/*", "*://chat.openai.com/*"]; // для tabs.query (нужны host-permissions)
+const CHATGPT_OPEN_URL = "https://chatgpt.com/"; // что открываем, если таба нет
+const READY_POLL_MS = 300;       // как часто опрашивать content.js на готовность кнопки Start
+const READY_TIMEOUT_MS = 20000;  // сколько ждать готовности таба, прежде чем сдаться
+const LOAD_POLL_MS = 150;        // как часто опрашивать status таба при ожидании загрузки
+const CREATE_GRACE_MS = 3000;    // ждём появления уже открывающегося таба ChatGPT, прежде чем создавать свой
+// Пауза ПОСЛЕ полной загрузки СВЕЖЕСОЗДАННОГО таба, прежде чем рапортовать готовность:
+// страница загрузилась (status==="complete"), но захвату диктовки нужно ещё немного
+// «осесть». Только для созданного нами таба; существующий уже прогрет (см. §6.16).
+const CREATED_TAB_SETTLE_MS = 1000;
 
 let ws = null;
 let reconnectDelay = RECONNECT_MIN_MS;
@@ -26,6 +54,14 @@ let chatGptTabId = null;
 // Запоминаем на старте, возвращаем по сигналу "recording" (когда захват уже пошёл —
 // переключаться обратно безопасно). null — возвращать нечего (см. §6.15).
 let prevActiveTabId = null;
+
+// Признак: таб ChatGPT открыли МЫ сами (его не было). Тогда после старта записи
+// НЕ возвращаемся на прежний таб — остаёмся в созданном, не дёргаем «туда-сюда» (см. §6.15).
+let createdChatGptTab = false;
+
+// ensureTab уже выполняется — защита от создания двух табов, если ensureTab прилетит
+// несколько раз подряд (старт сервера + подключение + реконнект).
+let ensureInFlight = false;
 
 function connect() {
   clearTimeout(reconnectTimer);
@@ -56,8 +92,10 @@ function connect() {
         break;
       case "mic":
         console.log("[Gptgraber] команда от сервера: mic");
-        // Сначала вывести таб ChatGPT в активные (и сфокусировать его окно),
-        // ТОЛЬКО ПОТОМ кликать Start — иначе захват микрофона в фоновом табе не идёт.
+        // Сначала вывести таб ChatGPT в активные (и сфокусировать его окно), ТОЛЬКО
+        // ПОТОМ кликать Start — иначе захват микрофона в фоновом табе не идёт (§6.15).
+        // Никаких слепых задержек тут нет: готовность свежесозданного таба обеспечена
+        // заранее, на этапе ensureTab (загрузка + осадка), см. ensureChatGptTabReady.
         activateChatGptTab().then(() => broadcastToTabs({ type: "mic" }));
         break;
       case "stop":
@@ -65,6 +103,12 @@ function connect() {
         // Submit/clear работают и в фоновом табе — активация не нужна.
         console.log("[Gptgraber] команда от сервера:", msg.type);
         broadcastToTabs({ type: msg.type });
+        break;
+      case "ensureTab":
+        // Сервер просит подготовить таб ChatGPT (открыть, если нет) и подтвердить
+        // готовность — он по этому "ready" начнёт запись (или просто прогревается).
+        console.log("[Gptgraber] команда от сервера: ensureTab");
+        ensureChatGptTabReady();
         break;
       default:
         console.debug("[Gptgraber] входящее:", msg);
@@ -123,10 +167,157 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 browser.tabs.onRemoved.addListener((tabId) => {
   if (tabId === chatGptTabId) {
     chatGptTabId = null;
+    createdChatGptTab = false;
     console.log("[Gptgraber] таб ChatGPT закрыт — забыли его id.");
   }
   if (tabId === prevActiveTabId) prevActiveTabId = null; // возвращать уже некуда
 });
+
+// При установке/обновлении расширения content.js в уже открытых табах остаётся
+// СТАРЫМ — Firefox не переинжектит content script в существующие табы. Перезагружаем
+// табы ChatGPT, чтобы их content.js совпал с обновлённым background. Это и удобный
+// dev-цикл (не нужно вручную жать Ctrl+R после обновления, см. tools\update-ext.ps1),
+// и корректное поведение вообще. reason browser_update/прочее не трогаем.
+browser.runtime.onInstalled.addListener((details) => {
+  if (details.reason !== "install" && details.reason !== "update") return;
+  browser.tabs.query({ url: CHATGPT_MATCH }).then((tabs) => {
+    for (const t of tabs) {
+      browser.tabs.reload(t.id).catch(() => { /* таб мог закрыться — ок */ });
+    }
+  }).catch((err) => console.warn("[Gptgraber] не смог перезагрузить табы ChatGPT после обновления:", err));
+});
+
+// Подготовить таб ChatGPT по команде ensureTab (см. §6.16): найти существующий таб
+// (tabs.query по url — нужны host-permissions), при отсутствии открыть новый ПАССИВНО
+// (active:false, чтобы не дёргать пользователя на прогреве). Затем дождаться готовности
+// и сообщить серверу "ready". Готовность СВЕЖЕСОЗДАННОГО таба = полная загрузка страницы
+// (status==="complete") + кнопка «Start dictation» + осадка CREATED_TAB_SETTLE_MS;
+// у существующего таба страница уже прогрета, ждём только кнопку. Активацию таба и клик
+// делает уже обработчик mic (после ready) — здесь только готовим.
+async function ensureChatGptTabReady() {
+  // Защита от параллельных ensureTab (на старте/реконнекте их может прилететь несколько):
+  // иначе два прохода одновременно не найдут таб и создадут ДВА таба ChatGPT.
+  if (ensureInFlight) {
+    console.log("[Gptgraber] ensureTab уже выполняется — пропускаю повторный.");
+    return;
+  }
+  ensureInFlight = true;
+  try {
+    let tabId = await findChatGptTabId();
+
+    // Таба нет? Возможно, Firefox только что запущен сервером с ChatGPT, и стартовый таб
+    // ещё не «закоммитил» свой URL — tabs.query его пока не видит. Дадим ему шанс появиться,
+    // прежде чем создавать свой, иначе на старте FF получаются ДВА таба ChatGPT.
+    if (tabId == null) {
+      tabId = await waitForChatGptTabId(CREATE_GRACE_MS);
+    }
+
+    if (tabId == null) {
+      try {
+        const created = await browser.tabs.create({ url: CHATGPT_OPEN_URL, active: false });
+        tabId = created.id;
+        createdChatGptTab = true;   // таб наш — после старта останемся в нём
+        console.log("[Gptgraber] открыл таб ChatGPT (id=" + tabId + ").");
+      } catch (err) {
+        console.warn("[Gptgraber] не удалось открыть таб ChatGPT:", err);
+        return;
+      }
+    } else {
+      createdChatGptTab = false;    // таб уже был / открыт сервером — вежливо вернём прежний
+    }
+
+    chatGptTabId = tabId;
+
+    // Свежесозданный таб: сначала дождаться, что страница реально догрузилась
+    // (status==="complete") — иначе кнопка диктовки может уже появиться, а захват ещё
+    // не готов. Существующий таб уже загружен — этот шаг пропускаем.
+    if (createdChatGptTab) {
+      await waitTabLoaded(tabId, READY_TIMEOUT_MS);
+    }
+
+    const ready = await waitTabReady(tabId, READY_TIMEOUT_MS);
+    if (!ready) {
+      console.warn("[Gptgraber] таб ChatGPT не стал готов за " + READY_TIMEOUT_MS + " мс (нет кнопки диктовки?).");
+      return;
+    }
+
+    // Свежесозданному табу даём ~1 c «осесть» после загрузки, прежде чем рапортовать
+    // готовность: дальше сервер сразу пойдёт в старт записи (поднимет FF, mic), и к тому
+    // моменту захват должен быть способен стартовать. Существующему табу это не нужно.
+    if (createdChatGptTab) {
+      await delay(CREATED_TAB_SETTLE_MS);
+    }
+
+    send({ type: "ready", payload: "" });
+    console.log("[Gptgraber] таб ChatGPT готов — сообщил серверу (ready).");
+  } finally {
+    ensureInFlight = false;
+  }
+}
+
+// Найти id таба ChatGPT: предпочесть уже известный (из register/работы), иначе первый по url.
+// null — таба нет (или его url ещё не виден в tabs.query — тогда поможет waitForChatGptTabId).
+async function findChatGptTabId() {
+  try {
+    const tabs = await browser.tabs.query({ url: CHATGPT_MATCH });
+    const tab = tabs.find((t) => t.id === chatGptTabId) || tabs[0];
+    if (tab) return tab.id;
+  } catch (err) {
+    console.warn("[Gptgraber] tabs.query(chatgpt) не удался:", err);
+  }
+  // chatGptTabId мог прийти из register (content.js) даже раньше, чем url стал виден в query.
+  return chatGptTabId;
+}
+
+// Подождать появления таба ChatGPT (на случай только что запущенного сервером Firefox:
+// его стартовый таб ещё грузится и не виден в tabs.query). null — так и не появился.
+async function waitForChatGptTabId(timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await delay(LOAD_POLL_MS);
+    const id = await findChatGptTabId();
+    if (id != null) {
+      console.log("[Gptgraber] таб ChatGPT появился сам (id=" + id + ") — второй не создаю.");
+      return id;
+    }
+  }
+  return null;
+}
+
+// Дождаться полной загрузки страницы таба (status==="complete"). Для свежесозданного
+// таба: пока грузится — status "loading"; "complete" = ресурсы загружены. Опрос tabs.get
+// прав не требует. true — дождались, false — таймаут/таб исчез.
+async function waitTabLoaded(tabId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const t = await browser.tabs.get(tabId);
+      if (t.status === "complete") return true;
+    } catch {
+      return false; // таб закрылся/недоступен
+    }
+    await delay(LOAD_POLL_MS);
+  }
+  return false;
+}
+
+// Опрашивать content.js, пока он не подтвердит наличие кнопки «Start dictation»
+// (страница загрузилась и диктовка возможна) или не выйдет таймаут.
+async function waitTabReady(tabId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    let ready = false;
+    try {
+      const r = await browser.tabs.sendMessage(tabId, { type: "checkReady" });
+      ready = !!(r && r.ready);
+    } catch { /* content.js ещё не загрузился в табе — считаем «не готов» */ }
+    if (ready) return true;
+    await delay(READY_POLL_MS);
+  }
+  return false;
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Активировать таб ChatGPT и сфокусировать его окно перед стартом диктовки.
 // Без активного таба Firefox не запускает захват микрофона (защита от скрытой
@@ -144,7 +335,9 @@ async function activateChatGptTab() {
     // после старта записи. tabs.get/query без url-фильтра прав не требуют (см. §6.15).
     const chatTab = await browser.tabs.get(chatGptTabId);
     const winId = chatTab.windowId;
-    if (winId != null) {
+    // Прежний таб запоминаем ТОЛЬКО если таб ChatGPT был не наш. Если мы его создали
+    // сами (createdChatGptTab) — остаёмся в нём, прежний не возвращаем (см. §6.15).
+    if (!createdChatGptTab && winId != null) {
       const [active] = await browser.tabs.query({ active: true, windowId: winId });
       if (active && active.id !== chatGptTabId) prevActiveTabId = active.id;
     }

@@ -13,6 +13,22 @@
 (() => {
   "use strict";
 
+  // Метки времени (ЧЧ:ММ:СС.мс) на наши логи — для стыковки таймингов с background/сервером.
+  // Патчим console в изолированном мире content script (страницы ChatGPT не касается).
+  try {
+    const _ol = console.log.bind(console);
+    const _ow = console.warn.bind(console);
+    const _od = console.debug.bind(console);
+    const _ts = () => {
+      const d = new Date();
+      const p = (n, w = 2) => String(n).padStart(w, "0");
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+    };
+    console.log = (...a) => _ol(_ts(), ...a);
+    console.warn = (...a) => _ow(_ts(), ...a);
+    console.debug = (...a) => _od(_ts(), ...a);
+  } catch (e) { /* консоль не патчится — не критично */ }
+
   console.log("[Gptgraber] content script загружен:", location.href);
 
   const COMPOSER_SELECTOR = "#prompt-textarea";
@@ -159,9 +175,14 @@
     }, 100);
   }
 
-  // Команды от background: mic (старт), stop (птичка), clear (очистить поле).
+  // Команды от background: mic (старт), stop (птичка), clear (очистить поле),
+  // checkReady (готова ли страница к диктовке — есть ли кнопка «Start dictation»).
   browser.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
+    if (msg.type === "checkReady") {
+      // Возвращаем Promise — это и есть ответ для background (sendMessage его получит).
+      return Promise.resolve({ ready: !!findDictationButton("Start") });
+    }
     if (msg.type === "mic") {
       clickDictation("Start", "старт диктовки");
       waitRecordingThenNotify();

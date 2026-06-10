@@ -1,0 +1,14 @@
+{
+  "name": "gptgraber-extension-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Сборка, линт и подпись Firefox-расширения Gptgraber через web-ext.",
+  "scripts": {
+    "lint:ext": "web-ext lint --source-dir=extension-firefox --ignore-files=README.md",
+    "build:ext": "web-ext build --source-dir=extension-firefox --artifacts-dir=dist --ignore-files=README.md --overwrite-dest",
+    "sign:ext": "web-ext sign --source-dir=extension-firefox --artifacts-dir=dist --ignore-files=README.md --channel=unlisted"
+  },
+  "devDependencies": {
+    "web-ext": "^8.3.0"
+  }
+}
