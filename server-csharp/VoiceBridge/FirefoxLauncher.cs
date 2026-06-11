@@ -15,6 +15,19 @@ namespace VoiceBridge;
 /// </summary>
 internal static class FirefoxLauncher
 {
+    // Момент нашего последнего запуска Firefox. Пока не прошло FirefoxLaunchGraceMs,
+    // повторные Launch подавляются: прогрев на старте сервера и старт записи — два
+    // независимых вызова, без этой защиты они открывали ДВА окна браузера (§6.19).
+    // long.MinValue = «ещё не запускали»; проверять ЯВНО, а не вычитанием — разность
+    // TickCount64 - MinValue переполняется в отрицательное, и IsStartingUp был бы
+    // вечно true (FF переставал стартовать вовсе, а ensureTab всегда уходил с «cold»).
+    private static long _lastLaunchTicks = long.MinValue;
+
+    /// <summary>Firefox недавно запущен нами и, вероятно, ещё поднимается.</summary>
+    public static bool IsStartingUp =>
+        _lastLaunchTicks != long.MinValue
+        && Environment.TickCount64 - _lastLaunchTicks < Config.FirefoxLaunchGraceMs;
+
     /// <summary>Запущен ли сейчас процесс Firefox.</summary>
     public static bool IsRunning()
     {
@@ -23,17 +36,25 @@ internal static class FirefoxLauncher
     }
 
     /// <summary>
-    /// Открыть <paramref name="url"/> в Firefox. Если FF уже запущен — откроется
-    /// новый таб в существующем экземпляре (ремоутинг FF); если нет — стартует
-    /// браузер с этим табом. Возвращает false, если firefox.exe не найден / не стартовал.
+    /// Запустить Firefox БЕЗ URL: табы поднимет восстановление сессии, а таб ChatGPT
+    /// найдёт/создаст расширение (ensureTab) — единая точка истины. Раньше мы передавали
+    /// URL ChatGPT — при включённом восстановлении сессии это давало ДУБЛЬ таба:
+    /// один из сессии + один из командной строки (§6.19д).
+    /// Возвращает false, если firefox.exe не найден / не стартовал.
     /// </summary>
-    public static bool Launch(string url)
+    public static bool Launch()
     {
+        // Уже запускается — второй firefox.exe дал бы второе окно (см. _lastLaunchTicks).
+        if (IsStartingUp)
+        {
+            Log.Info(Lang.T("ff.already_starting"));
+            return true;
+        }
+
         string? exe = Config.FirefoxPath ?? FindExe();
         if (exe is null)
         {
-            Log.Error("firefox.exe не найден (ни в реестре, ни в стандартных папках). "
-                      + "Укажи путь в Config.FirefoxPath или открой ChatGPT в Firefox вручную.");
+            Log.Error(Lang.T("ff.not_found"));
             return false;
         }
 
@@ -42,15 +63,15 @@ internal static class FirefoxLauncher
             Process.Start(new ProcessStartInfo
             {
                 FileName = exe,
-                Arguments = $"\"{url}\"",
                 UseShellExecute = false,
             });
-            Log.Ok($"Запускаю Firefox: {exe} «{url}».");
+            _lastLaunchTicks = Environment.TickCount64;
+            Log.Ok(Lang.T("ff.launching", exe));
             return true;
         }
         catch (Exception ex)
         {
-            Log.Error($"Не удалось запустить Firefox ({exe}): {ex.Message}");
+            Log.Error(Lang.T("ff.launch_fail", exe, ex.Message));
             return false;
         }
     }

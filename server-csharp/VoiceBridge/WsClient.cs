@@ -37,13 +37,13 @@ internal sealed class WsClient
             try
             {
                 using var socket = new ClientWebSocket();
-                Log.Info($"Подключаюсь к серверу {Config.WsClientUrl} ...");
+                Log.Info(Lang.T("wsc.connecting", Config.WsClientUrl));
                 await socket.ConnectAsync(new Uri(Config.WsClientUrl), ct);
 
                 _socket = socket;
                 delay = Config.ReconnectMinMs;
                 ConnectionChanged?.Invoke(true);
-                Log.Ok($"Связь с сервером установлена ({Config.WsClientUrl}).");
+                Log.Ok(Lang.T("wsc.connected", Config.WsClientUrl));
 
                 await SendAsync(new WsMessage { Type = "hello", Payload = "controller" }, ct);
                 await ReceiveLoop(socket, ct);
@@ -51,7 +51,7 @@ internal sealed class WsClient
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Log.Warn($"Нет связи с сервером: {ex.Message}");
+                Log.Warn(Lang.T("wsc.no_conn", ex.Message));
             }
             finally
             {
@@ -74,7 +74,7 @@ internal sealed class WsClient
         var socket = _socket;
         if (socket is null || socket.State != WebSocketState.Open)
         {
-            Log.Warn($"Нет связи с сервером — '{msg.Type}' не отправлен.");
+            Log.Warn(Lang.T("wsc.send_no_conn", msg.Type));
             return;
         }
 
@@ -87,7 +87,7 @@ internal sealed class WsClient
             if (socket.State == WebSocketState.Open)
                 await socket.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
         }
-        catch (Exception ex) { Log.Warn($"Не удалось отправить '{msg.Type}': {ex.Message}"); }
+        catch (Exception ex) { Log.Warn(Lang.T("ws.send_fail", msg.Type, ex.Message)); }
         finally { _sendLock.Release(); }
     }
 
@@ -122,7 +122,7 @@ internal sealed class WsClient
         try { msg = JsonSerializer.Deserialize<WsMessage>(json, JsonOpts); }
         catch (JsonException)
         {
-            Log.Warn($"Некорректный JSON от сервера: {Preview(json)}");
+            Log.Warn(Lang.T("wsc.bad_json", Preview(json)));
             return;
         }
 
@@ -131,12 +131,12 @@ internal sealed class WsClient
         switch (msg.Type)
         {
             case "inject":
-                Log.Info($"Текст от сервера ({msg.Payload.Length} симв.) — вставляю в захваченное окно.");
+                Log.Info(Lang.T("wsc.inject", msg.Payload.Length));
                 InjectReceived?.Invoke(msg.Payload);
                 break;
 
             case "hello":
-                Log.Info($"Сервер: {Preview(msg.Payload)}");
+                Log.Info(Lang.T("wsc.hello", Preview(msg.Payload)));
                 break;
 
             // ack/mic/stop/clear контроллеру не адресованы — молча игнорируем.

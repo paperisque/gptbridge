@@ -19,44 +19,46 @@ internal static class Injector
     /// true (вариант Ctrl+Win+Y) — оставить продиктованный текст в буфере обмена.
     /// false — вернуть прежнее содержимое буфера после вставки.
     /// </param>
-    public static void Inject(bool keepInClipboard = false)
+    /// <returns>true — вставка прошла; false — отменена (нет окна/текста/буфера).</returns>
+    public static bool Inject(bool keepInClipboard = false)
     {
         IntPtr target = SharedState.TargetHwnd;
         if (target == IntPtr.Zero || !Native.IsWindow(target))
         {
-            Log.Warn("Целевое окно не определено или закрыто — вставка отменена.");
+            Log.Warn(Lang.T("inject.no_target"));
             Native.MessageBeep(0xFFFFFFFF);
-            return;
+            return false;
         }
 
         string text = SharedState.LastText;
         if (string.IsNullOrEmpty(text))
         {
-            Log.Warn("Нет текста для вставки (расширение ещё ничего не прислало).");
+            Log.Warn(Lang.T("inject.no_text"));
             Native.MessageBeep(0xFFFFFFFF);
-            return;
+            return false;
         }
 
         string? previous = Clipboard.SetUnicodeText(text, out bool clipboardOk);
         if (!clipboardOk)
         {
-            Log.Error("Не удалось записать буфер обмена — вставка отменена.");
-            return;
+            Log.Error(Lang.T("inject.clipboard_fail"));
+            return false;
         }
 
         if (!ForceForeground(target))
-            Log.Warn("Цель не удалось гарантированно поднять на передний план — пробую вставить всё равно.");
+            Log.Warn(Lang.T("inject.fg_warn"));
 
         Thread.Sleep(Config.ForegroundSettleMs);
         SendCtrlV();
-        Log.Ok($"Вставлено {text.Length} симв. в HWND=0x{target.ToInt64():X} «{Native.GetWindowTitle(target)}»"
-               + (keepInClipboard ? " (текст оставлен в буфере)." : "."));
+        Log.Ok(Lang.T("inject.done", text.Length, target.ToInt64(), Native.GetWindowTitle(target))
+               + (keepInClipboard ? Lang.T("inject.kept_suffix") : "."));
 
         if (!keepInClipboard && previous is not null)
         {
             Thread.Sleep(Config.ClipboardRestoreDelayMs);
             Clipboard.SetUnicodeText(previous, out _);
         }
+        return true;
     }
 
     /// <summary>
@@ -128,6 +130,6 @@ internal static class Injector
 
         uint sent = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Native.INPUT>());
         if (sent != inputs.Length)
-            Log.Warn($"SendInput отправил {sent}/{inputs.Length} событий (код {Marshal.GetLastWin32Error()}).");
+            Log.Warn(Lang.T("inject.sendinput_warn", sent, inputs.Length, Marshal.GetLastWin32Error()));
     }
 }

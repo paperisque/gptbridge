@@ -17,4 +17,16 @@
     <UseAppHost>false</UseAppHost>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Языковые модули (Lang.cs читает их из lang/ рядом с DLL). -->
+    <None Update="lang\*.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Приватные шрифты индикатора (StatusOverlay.PickFont; см. fonts/README.md). -->
+    <None Update="fonts\*.ttf" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fonts\*.otf" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

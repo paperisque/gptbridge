@@ -39,9 +39,9 @@ internal sealed class KeyboardHook : IDisposable
         IntPtr hMod = Native.GetModuleHandle(null);
         _hook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _proc, hMod, 0);
         if (_hook == IntPtr.Zero)
-            Log.Error($"Не удалось установить хук клавиатуры (код {Marshal.GetLastWin32Error()}).");
+            Log.Error(Lang.T("hook.fail", Marshal.GetLastWin32Error()));
         else
-            Log.Ok("Хук клавиатуры активен: Ctrl+Win — старт/стоп диктовки; Ctrl+Win+Y — стоп + текст в буфер.");
+            Log.Ok(Lang.T("hook.active"));
     }
 
     private IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam)

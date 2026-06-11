@@ -17,6 +17,22 @@ dist/
 web-ext-artifacts/
 *.xpi
 
+# ---- Claude Code (личные настройки) ----
+.claude/settings.local.json
+.claude/beep-disabled
+
+# ---- Приватные шрифты индикатора (могут быть проприетарными — не коммитим) ----
+server-csharp/VoiceBridge/fonts/*.ttf
+server-csharp/VoiceBridge/fonts/*.otf
+
+# ---- Не для публичного репозитория ----
+# Демо-ролики (тяжёлые; решим позже, чем делиться) и внутренняя «память» ассистента.
+docs/demo.gif
+docs/demo_mini.gif
+docs/demo.mp4
+docs/test.gif
+docs/NEXTMEMORY.md
+
 # ---- OS ----
 Thumbs.db
 desktop.ini

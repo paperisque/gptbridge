@@ -45,13 +45,11 @@ internal static class Config
     // фокус минимум столько с момента mic, даже если «recording» уже пришёл.
     public const int MinFocusHoldMs = 1500;
 
-    // Авто-подготовка Firefox: если FF не запущен — поднять его с табом ChatGPT;
-    // если запущен, но таба нет — расширение откроет таб (см. ensureTab/ready).
+    // Авто-подготовка Firefox: если FF не запущен — поднять его (БЕЗ URL: табы поднимет
+    // восстановление сессии, таб ChatGPT найдёт/создаст расширение через ensureTab —
+    // иначе при восстановлении сессии получался дубль таба, §6.19д).
     // Отключается флагом --no-autolaunch (см. Program.ParseArgs).
     public static bool AutoLaunchFirefox = true;
-
-    // URL, который открываем в Firefox при подготовке/запуске.
-    public const string ChatGptUrl = "https://chatgpt.com/";
 
     // Явный путь к firefox.exe (если null — ищем в реестре и стандартных местах).
     public static string? FirefoxPath = null;
@@ -62,7 +60,50 @@ internal static class Config
     public const int PrepareReadyTimeoutMs = 15000;
     public const int PrepareLaunchTimeoutMs = 25000;
 
+    // «Launch-grace»: столько после нашего запуска Firefox считается «уже запускающимся» —
+    // повторный Launch в этот период подавляется. Без этого прогрев на старте сервера и
+    // старт записи запускали firefox.exe независимо → ДВА окна браузера (§6.19).
+    public const int FirefoxLaunchGraceMs = 30000;
+
+    // Страховка после СТОПа: если распознанный текст не пришёл за этот срок —
+    // отбой вставки (разоружаемся), индикатор показывает ошибку (§6.19).
+    public const int InjectTimeoutMs = 20000;
+
     // Реконнект сетевого клиента к серверу: стартовая и максимальная пауза (мс).
     public const int ReconnectMinMs = 1000;
     public const int ReconnectMaxMs = 15000;
+
+    // ---- Системный индикатор статуса (StatusOverlay) ----
+
+    // Показывать ли индикатор-«пилюлю» вообще (--no-overlay отключает).
+    public static bool ShowOverlay = true;
+
+    // Компактный режим: только значок-кружок, без подписи (--overlay-compact).
+    public static bool OverlayCompact = false;
+
+    // Сколько держать финальные фазы («вставлено» / «ошибка») перед скрытием (мс).
+    public const uint OverlayDoneHideMs = 1200;
+    public const uint OverlayErrorHideMs = 2500;
+
+    // Страховка: «Распознаю…» обычно живёт 1–3 с; если текст так и не пришёл —
+    // не держать пилюлю вечно, скрыть через этот срок (мс).
+    public const uint OverlayTranscribeStuckMs = 30000;
+
+    // Период кадра анимации индикатора (мерцание звёздочки, пульс микрофона), мс.
+    public const uint OverlayAnimTickMs = 80;
+
+    // Цвета индикатора (COLORREF 0x00BBGGRR). Дефолт — тёмная пилюля с белой рамкой.
+    // Меняются флагом --overlay-colors key=RRGGBB,… (см. Program.ParseOverlayColors):
+    //   bg фон, border рамка, text подпись, wait ожидание (звёздочка/микрофон до записи),
+    //   rec запись и галочка «вставлено», busy распознавание, err ошибка.
+    public static uint OverlayColBg = Rgb(32, 32, 34);
+    public static uint OverlayColBorder = Rgb(255, 255, 255);
+    public static uint OverlayColText = Rgb(240, 240, 240);
+    public static uint OverlayColWait = Rgb(255, 165, 0);
+    public static uint OverlayColRec = Rgb(90, 205, 100);
+    public static uint OverlayColBusy = Rgb(80, 155, 255);
+    public static uint OverlayColErr = Rgb(235, 80, 80);
+
+    /// <summary>RGB → COLORREF (у GDI порядок байтов 0x00BBGGRR).</summary>
+    public static uint Rgb(int r, int g, int b) => (uint)(r | (g << 8) | (b << 16));
 }

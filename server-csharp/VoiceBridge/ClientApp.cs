@@ -38,7 +38,7 @@ internal static class ClientApp
         {
             InjectReceived = OnInjectReceived,
             ConnectionChanged = connected =>
-                Log.Info(connected ? "● Мост к серверу подключён." : "○ Связь с сервером потеряна — реконнект..."),
+                Log.Info(Lang.T(connected ? "client.connected" : "client.disconnected")),
         };
         _ = _client.RunAsync(cts.Token);
 
@@ -71,7 +71,7 @@ internal static class ClientApp
 
         _hook.Dispose();
         cts.Cancel();
-        Log.Info("VoiceBridge (клиент) остановлен.");
+        Log.Info(Lang.T("client.stopped"));
     }
 
     /// <summary>Локальный хоткей Ctrl+Win (или +Y). На потоке цикла сообщений.</summary>
@@ -83,7 +83,7 @@ internal static class ClientApp
             _pendingInject = false;
             _state = DictState.Recording;
             _client.Send(new WsMessage { Type = "start" });
-            Log.Ok("▶ Старт диктовки — запрос отправлен серверу. Говори.");
+            Log.Ok(Lang.T("client.start"));
         }
         else
         {
@@ -93,8 +93,8 @@ internal static class ClientApp
             _pendingInject = true;
             _client.Send(new WsMessage { Type = "stop" });
             _state = DictState.Idle;
-            Log.Ok($"■ Стоп — жду текст от сервера. Цель=0x{_injectTarget.ToInt64():X} «{Native.GetWindowTitle(_injectTarget)}»"
-                   + (withY ? " — текст останется в буфере." : "."));
+            Log.Ok(Lang.T("client.stop", _injectTarget.ToInt64(), Native.GetWindowTitle(_injectTarget))
+                   + (withY ? Lang.T("suffix.keep_buffer") : "."));
         }
     }
 
@@ -117,10 +117,10 @@ internal static class ClientApp
 
     private static void Banner()
     {
-        Log.Info("=== VoiceBridge (сетевой клиент) — диктовка ChatGPT в активное окно этой машины ===");
-        Log.Info($"Сервер: {Config.WsClientUrl}");
-        Log.Info("Ctrl+Win        — старт диктовки; повторно — стоп + вставка в активное окно.");
-        Log.Info("Ctrl+Win+Y      — стоп + вставка + текст дополнительно остаётся в буфере обмена.");
-        Log.Info("Ctrl+C          — выход.");
+        Log.Info(Lang.T("client.banner"));
+        Log.Info(Lang.T("client.banner.server", Config.WsClientUrl));
+        Log.Info(Lang.T("client.banner.hotkey1"));
+        Log.Info(Lang.T("client.banner.hotkey2"));
+        Log.Info(Lang.T("client.banner.exit"));
     }
 }

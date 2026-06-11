@@ -175,8 +175,88 @@
     }, 100);
   }
 
-  // Команды от background: mic (старт), stop (птичка), clear (очистить поле),
-  // checkReady (готова ли страница к диктовке — есть ли кнопка «Start dictation»).
+  // Кнопка отправки промпта — НАДЁЖНЫЙ индикатор исхода распознавания (наблюдение
+  // пользователя): она появляется, ТОЛЬКО если в композере есть текст. Если запись
+  // была тишиной — её нет, вместо неё возвращается «стартовая» кнопка голосового
+  // режима (справа от диктовки; мы её не используем).
+  // Ищем цепочкой: id (первично) → data-testid → aria-label "Send prompt". id/testid
+  // могут со временем сменить, aria-label может быть локализован — потому все три.
+  function hasComposerSubmit() {
+    return !!(
+      document.querySelector("#composer-submit-button") ||
+      document.querySelector('button[data-testid="send-button"]') ||
+      document.querySelector('button[aria-label="Send prompt"]')
+    );
+  }
+
+  // Кнопка ГОЛОСОВОГО РЕЖИМА (справа от диктовки; мы её не используем) — позитивный
+  // индикатор исхода «пусто» (наблюдение пользователя): при тишине она возвращается
+  // на место кнопки отправки. Пока идёт распознавание, нет НИ её, НИ кнопки отправки.
+  function hasVoiceModeButton() {
+    const root = findComposerForm() || document;
+    if (root.querySelector('button[data-testid="composer-speech-button"]')) return true;
+    return [...root.querySelectorAll("button[aria-label]")].some((b) =>
+      /voice mode|голосов/i.test(b.getAttribute("aria-label") || "")
+    );
+  }
+
+  // После Submit следим за ИСХОДОМ распознавания и ждём ОДНОЗНАЧНОГО сигнала:
+  //   кнопка отправки (или текст) -> распознался текст, выходим молча (текст отправит
+  //   обычный поллер tick); кнопка голосового режима -> «пусто», шлём {type:"empty"} —
+  //   иначе сервер висел бы в «Распознаю…» до страховочного таймаута.
+  // ВАЖНО: «пусто» НЕ определяется тупым таймером — медленное распознавание давало
+  // ложное «пусто», и текст прошлой сессии примешивался к следующей. Таймер остаётся
+  // лишь страховкой на случай, если селекторы кнопок устареют.
+  const EMPTY_CONFIRM_MS = 700;          // осадка после появления голосовой кнопки
+  const EMPTY_FALLBACK_MS = 8000;        // нет НИКАКИХ сигналов столько -> считаем «пусто»
+  const EMPTY_WATCH_TIMEOUT_MS = 30000;  // дольше не следим (страховка от вечного интервала)
+  let emptyWatchTimer = null;
+  function watchTranscriptionOutcome() {
+    clearInterval(emptyWatchTimer);
+    const startedAt = performance.now();
+    let uiGoneAt = 0;
+    let voiceSeenAt = 0;
+    emptyWatchTimer = setInterval(() => {
+      if (hasComposerSubmit() || readComposerText()) { // распознался текст — обычный поток
+        clearInterval(emptyWatchTimer);
+        emptyWatchTimer = null;
+        return;
+      }
+      if (isRecordingLive()) {
+        uiGoneAt = 0; // UI ещё открыт — ждём
+        voiceSeenAt = 0;
+      } else {
+        const now = performance.now();
+        if (!uiGoneAt) uiGoneAt = now;
+
+        if (!hasVoiceModeButton()) {
+          voiceSeenAt = 0; // исход ещё не определён (распознавание может идти)
+        } else if (!voiceSeenAt) {
+          voiceSeenAt = now;
+        }
+
+        // Голосовая кнопка вернулась (+осадка против гонки с поздней вставкой текста) —
+        // или вообще никаких сигналов слишком долго (фолбэк на случай смены селекторов).
+        if ((voiceSeenAt && now - voiceSeenAt >= EMPTY_CONFIRM_MS)
+            || now - uiGoneAt >= EMPTY_FALLBACK_MS) {
+          clearInterval(emptyWatchTimer);
+          emptyWatchTimer = null;
+          browser.runtime
+            .sendMessage({ type: "empty" })
+            .catch((err) => console.warn("[Gptgraber] sendMessage(empty):", err));
+          console.log("[Gptgraber] распознано пусто (" + (voiceSeenAt ? "вернулась кнопка голосового режима" : "фолбэк по таймеру") + ") — уведомил сервер (empty).");
+          return;
+        }
+      }
+      if (performance.now() - startedAt > EMPTY_WATCH_TIMEOUT_MS) {
+        clearInterval(emptyWatchTimer);
+        emptyWatchTimer = null;
+      }
+    }, 250);
+  }
+
+  // Команды от background: mic (старт), stop (птичка), cancel (отмена без вставки),
+  // clear (очистить поле), checkReady (готова ли страница — есть ли кнопка «Start dictation»).
   browser.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
     if (msg.type === "checkReady") {
@@ -184,9 +264,22 @@
       return Promise.resolve({ ready: !!findDictationButton("Start") });
     }
     if (msg.type === "mic") {
+      clearInterval(emptyWatchTimer);
+      emptyWatchTimer = null;
       clickDictation("Start", "старт диктовки");
       waitRecordingThenNotify();
-    } else if (msg.type === "stop") clickDictation("Submit", "финал диктовки");
+    } else if (msg.type === "stop") {
+      clickDictation("Submit", "финал диктовки");
+      watchTranscriptionOutcome();
+    }
+    else if (msg.type === "cancel") {
+      // Отбой зависшей сессии (захват не стартовал): закрыть UI диктовки без распознавания.
+      clearInterval(recWaitTimer);
+      recWaitTimer = null;
+      clearInterval(emptyWatchTimer);
+      emptyWatchTimer = null;
+      clickDictation("Cancel", "отмена диктовки");
+    }
     else if (msg.type === "clear") clearComposer();
   });
 

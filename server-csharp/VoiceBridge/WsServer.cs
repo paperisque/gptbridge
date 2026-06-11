@@ -48,6 +48,9 @@ internal sealed class WsServer
     /// <summary>Вызывается (на потоке WS), когда расширение сообщило «таб ChatGPT готов к диктовке» (ready).</summary>
     public Action? ReadyReceived { get; set; }
 
+    /// <summary>Вызывается (на потоке WS), когда расширение сообщило «распознано пусто» (empty — в записи была тишина).</summary>
+    public Action? EmptyReceived { get; set; }
+
     /// <summary>Есть ли подключённое расширение Firefox (движок диктовки на связи).</summary>
     public bool HasFirefox
     {
@@ -65,13 +68,13 @@ internal sealed class WsServer
         }
         catch (HttpListenerException ex)
         {
-            Log.Error($"Не удалось открыть {Config.WsPrefix}: {ex.Message}");
-            Log.Error("Если это отказ доступа — зарезервируй URL (одноразово, в админ-консоли):");
+            Log.Error(Lang.T("ws.listen_fail", Config.WsPrefix, ex.Message));
+            Log.Error(Lang.T("ws.listen_fail_hint"));
             Log.Error($"  netsh http add urlacl url={Config.WsPrefix} user={Environment.UserDomainName}\\{Environment.UserName}");
             return;
         }
 
-        Log.Ok($"WS-сервер слушает {Config.WsPrefix} — жду подключения расширения...");
+        Log.Ok(Lang.T("ws.listening", Config.WsPrefix));
 
         // Корректно прерываем GetContextAsync по отмене.
         using (ct.Register(listener.Stop))
@@ -113,7 +116,7 @@ internal sealed class WsServer
 
         if (snapshot.Length == 0)
         {
-            Log.Warn($"Некому слать '{msg.Type}': расширение Firefox не подключено.");
+            Log.Warn(Lang.T("ws.no_firefox", msg.Type));
             return;
         }
 
@@ -145,14 +148,14 @@ internal sealed class WsServer
         }
         catch (Exception ex)
         {
-            Log.Error($"Ошибка WS-рукопожатия: {ex.Message}");
+            Log.Error(Lang.T("ws.handshake_fail", ex.Message));
             return;
         }
 
         int id = Interlocked.Increment(ref _nextId);
         var client = new ClientConnection(socket, id);
         lock (_clientsLock) _clients.Add(client);
-        Log.Ok($"Клиент #{id} подключился ({ctx.Request.RemoteEndPoint}) — роль определится по hello.");
+        Log.Ok(Lang.T("ws.client_connected", id, ctx.Request.RemoteEndPoint));
 
         await SendAsync(client, new WsMessage { Type = "hello", Payload = "VoiceBridge ready" }, ct);
 
@@ -182,13 +185,13 @@ internal sealed class WsServer
             }
         }
         catch (OperationCanceledException) { }
-        catch (WebSocketException ex) { Log.Warn($"WS-соединение #{client.Id} разорвано: {ex.Message}"); }
-        catch (Exception ex) { Log.Error($"Ошибка чтения WS #{client.Id}: {ex.Message}"); }
+        catch (WebSocketException ex) { Log.Warn(Lang.T("ws.conn_broken", client.Id, ex.Message)); }
+        catch (Exception ex) { Log.Error(Lang.T("ws.read_error", client.Id, ex.Message)); }
         finally
         {
             lock (_clientsLock) _clients.Remove(client);
             client.Dispose();
-            Log.Info($"Клиент #{client.Id} ({client.Role}) отключился.");
+            Log.Info(Lang.T("ws.client_disconnected", client.Id, client.Role));
         }
     }
 
@@ -201,7 +204,7 @@ internal sealed class WsServer
         }
         catch (JsonException)
         {
-            Log.Warn($"Некорректный JSON: {Preview(json)}");
+            Log.Warn(Lang.T("ws.bad_json", Preview(json)));
             return;
         }
 
@@ -211,20 +214,26 @@ internal sealed class WsServer
         {
             case "text":
                 SharedState.LastText = msg.Payload;
-                Log.Info($"Текст получен ({msg.Payload.Length} симв.): {Preview(msg.Payload)}");
+                Log.Info(Lang.T("ws.text_received", msg.Payload.Length, Preview(msg.Payload)));
                 await SendAsync(client, new WsMessage { Type = "ack", Payload = msg.Payload.Length.ToString() }, ct);
                 TextReceived?.Invoke();
                 break;
 
             case "recording":
-                Log.Info("Расширение: запись началась — возвращаю фокус в рабочее окно.");
+                Log.Info(Lang.T("ws.recording"));
                 RecordingStarted?.Invoke();
                 break;
 
             case "ready":
                 // Расширение: таб ChatGPT загружен, кнопка «Start dictation» доступна.
-                Log.Info("Расширение: таб ChatGPT готов к диктовке.");
+                Log.Info(Lang.T("ws.ready"));
                 ReadyReceived?.Invoke();
+                break;
+
+            case "empty":
+                // Расширение: распознавание дало пустоту (тишина) — текста не будет.
+                Log.Info(Lang.T("ws.empty"));
+                EmptyReceived?.Invoke();
                 break;
 
             case "hello":
@@ -232,23 +241,23 @@ internal sealed class WsServer
                 client.Role = msg.Payload.Contains("controller", StringComparison.OrdinalIgnoreCase)
                     ? ConnectionRole.Controller
                     : ConnectionRole.Firefox;
-                Log.Info($"Клиент #{client.Id} представился ({client.Role}): {Preview(msg.Payload)}");
+                Log.Info(Lang.T("ws.hello", client.Id, client.Role, Preview(msg.Payload)));
                 if (client.Role == ConnectionRole.Firefox) FirefoxConnected?.Invoke();
                 break;
 
             case "start":
                 // Сетевой клиент просит старт диктовки. Тяжёлую работу делает ServerApp на своём потоке.
-                Log.Info($"Сетевой клиент #{client.Id}: запрос СТАРТ.");
+                Log.Info(Lang.T("ws.ctrl_start", client.Id));
                 ControllerStartRequested?.Invoke(client.Id);
                 break;
 
             case "stop":
-                Log.Info($"Сетевой клиент #{client.Id}: запрос СТОП.");
+                Log.Info(Lang.T("ws.ctrl_stop", client.Id));
                 ControllerStopRequested?.Invoke(client.Id);
                 break;
 
             default:
-                Log.Warn($"Неизвестный тип сообщения: {msg.Type}");
+                Log.Warn(Lang.T("ws.unknown_type", msg.Type));
                 break;
         }
     }
@@ -264,7 +273,7 @@ internal sealed class WsServer
             if (client.Socket.State == WebSocketState.Open)
                 await client.Socket.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
         }
-        catch (Exception ex) { Log.Warn($"Не удалось отправить '{msg.Type}': {ex.Message}"); }
+        catch (Exception ex) { Log.Warn(Lang.T("ws.send_fail", msg.Type, ex.Message)); }
         finally { client.SendLock.Release(); }
     }
 
