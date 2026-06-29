@@ -48,12 +48,15 @@ A standalone `.exe` is not built (Windows Smart App Control blocks an unsigned a
 Flags go **after** the DLL path — `dotnet "…\WebView2Poc.dll" <flags>`:
 
 - `--lang en|de|ru` — UI language (overrides the system language; default is the Windows UI language);
-- `--tray` — start minimized to the tray.
+- `--tray` — start minimized to the tray;
+- `--no-beep` — turn off the confirmation sound on paste.
 
 ## Good to know
 
 - **Tray app.** Closing the window (×) hides it to the tray, it does not quit; exit via the tray menu. Microphone capture keeps working while the window is hidden or minimized.
 - **Single instance.** Launching it again does not start a second copy — it brings the already-running one out of the tray.
+- **Paste sound.** A short descending two-tone chime confirms a successful paste; turn it off with `--no-beep`.
+- **Cleaner ChatGPT.** The embedded page hides some clutter around the composer (extra buttons and a header) so it does not jump around when the window is small.
 - **Data location.** The ChatGPT profile (WebView2) and the log live next to the program, in a `data` folder: `%LOCALAPPDATA%\GptGrabber\data` for the installed app, `bin\Debug\net10.0-windows\data` for a dev build. Uninstalling removes it.
 - **No console window.** As the app is launched through the console-mode `dotnet.exe`, it relaunches itself windowless at startup (a brief flash is possible); all status goes to the tray icon, the always-on-top "pill" indicator and a log file.
 - **Icon.** Regenerate `installer\app.ico` from `icons\ico2.png` with `tools\make-icon.ps1`.

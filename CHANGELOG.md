@@ -3,6 +3,38 @@
 A short chronology of the work. WS protocol details — in [docs/PROTOCOL.md](docs/PROTOCOL.md);
 architecture, decisions and pitfalls — in [CLAUDE.md](CLAUDE.md).
 
+## 2026-06-29 — Standalone WebView2 version (GPT Grabber) + installer
+
+A second, self-contained version lives in `poc-webview2/` — it embeds ChatGPT via
+**WebView2** (Chromium), so it needs **no external Firefox, no extension and no network
+hub**. The Firefox-based version above is unchanged. Details — [poc-webview2/README.md](poc-webview2/README.md).
+
+- **App.** Hotkeys: Ctrl+Win (dictation), Ctrl+Win+Y (+clipboard), Ctrl+Win+Alt (re-paste
+  the last text), Ctrl+Win during prepare/recognize = cancel. Lives in the tray (× hides,
+  exit via the tray menu); the equalizer tray icon colour follows the phase. Status — the
+  same on-top "pill" indicator. A **?** button shows hotkeys and flags.
+- **Single instance.** A named mutex; launching it again just brings the running copy out
+  of the tray (broadcast of a registered window message).
+- **No console window.** `dotnet.exe` is a console host and SAC blocks an unsigned apphost,
+  so the app relaunches itself windowless at startup (a brief flash is possible).
+- **Paste sound.** A short descending two-tone "ding-dong" via `Beep` (not the system
+  MessageBeep, which sounded like an error). `--no-beep` turns it off.
+- **Hides ChatGPT clutter.** A CSS rule injected into `<head>` (survives React re-renders)
+  hides the block after `#thread-bottom` and the header before `#thread-bottom-container`.
+- **Flags:** `--lang en|de|ru` (UI language; default — Windows), `--tray` (start minimized
+  to the tray), `--no-beep`. Compact startup window (740×550).
+- **Data.** ChatGPT profile (WebView2) + log live next to the program in `data/`
+  (`%LOCALAPPDATA%\GptGrabber\data` when installed; `bin\…\data` for a dev build).
+- **Installer (Inno Setup).** One command — `tools\build-installer.ps1` (publish + a
+  bundled portable .NET 10 runtime + WebView2 Runtime bootstrap + ISCC). Per-user, no
+  admin, no wizard steps; clean uninstall (removes `data/`). Icon — `tools\make-icon.ps1`
+  from `icons\ico2.png`.
+- **Fix (extension build).** `.xpi` packaging now reads `manifest.json` as UTF-8 (PowerShell
+  5.1 `Get-Content -Raw` read it as ANSI → Cyrillic in the add-on description came out garbled).
+- Docs: English READMEs in their folders, Russian mirrors in `docs/`. The WS protocol
+  applies to the Firefox version only (PROTOCOL.md); the WebView2 version drives the page
+  via injected JS in-process.
+
 ## 2026-06-11 — Start/abort reliability (after field testing)
 
 - **"Recording" shown, but nothing records** (FF started manually, ChatGPT tab restored

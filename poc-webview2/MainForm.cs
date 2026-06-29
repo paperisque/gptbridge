@@ -27,6 +27,10 @@ internal sealed class MainForm : Form
     private readonly bool _startInTray; // --tray: стартовать сразу свёрнутым в трей
     private bool _trayStartDone;
 
+    // Полоса лога снизу: обычная высота и увеличенная — под открытую справку по «?».
+    private const int LogRowNormalPx = 150, LogRowHelpPx = 250;
+    private RowStyle _logRow = null!;
+
     // Сообщение «развернись из трея» от второго экземпляра (single-instance). Значение системно-
     // уникально по строке — одинаково во всех процессах, поэтому второй шлёт именно его (broadcast).
     public static readonly uint WmShowExisting = Win32.RegisterWindowMessage("GptGrabber.ShowExistingInstance.v1");
@@ -48,8 +52,8 @@ internal sealed class MainForm : Form
     {
         _startInTray = startInTray;
         Text = "GPT Grabber";
-        Width = 1100;
-        Height = 820;
+        Width = 740;   // компактнее (~на треть меньше прежних 1100×820)
+        Height = 550;
         // При старте в трей запускаемся за экраном — инициализация (WebView/хук) проходит,
         // но без видимой вспышки окна; затем в OnShown прячемся и центрируем на будущее.
         StartPosition = startInTray ? FormStartPosition.Manual : FormStartPosition.CenterScreen;
@@ -57,8 +61,9 @@ internal sealed class MainForm : Form
         ShowInTaskbar = false; // утилита трея; задаём ДО создания хэндла (без пересоздания окна)
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));  // WebView с ChatGPT
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 150)); // лог
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // WebView с ChatGPT
+        _logRow = new RowStyle(SizeType.Absolute, LogRowNormalPx); // лог (расширяется под открытую справку)
+        root.RowStyles.Add(_logRow);
 
         _web.Dock = DockStyle.Fill;
         _web.CreationProperties = new CoreWebView2CreationProperties
@@ -77,6 +82,7 @@ internal sealed class MainForm : Form
         _log.Font = new System.Drawing.Font("Consolas", 9f);
         _log.BackColor = System.Drawing.Color.FromArgb(24, 24, 26);
         _log.ForeColor = System.Drawing.Color.Gainsboro;
+        _log.Text = Environment.NewLine;   // верхний отступ: лог начинается не вплотную к краю
 
         root.Controls.Add(_web, 0, 0);
         root.Controls.Add(BuildLogHost(), 0, 1);
@@ -232,11 +238,15 @@ internal sealed class MainForm : Form
             _web.CoreWebView2.NavigationCompleted += async (_, e) =>
             {
                 Diag.Write($"navigation completed, success={e.IsSuccess}");
-                if (e.IsSuccess && !_firstClearDone)
+                if (e.IsSuccess)
                 {
-                    _firstClearDone = true;
-                    await Task.Delay(1500);          // дать странице осесть
-                    await Exec(ClearComposerScript); // снять восстановленный из сессии черновик
+                    await Exec(HideExtrasScript);    // спрятать лишний блок под #thread-bottom (CSS живёт в head)
+                    if (!_firstClearDone)
+                    {
+                        _firstClearDone = true;
+                        await Task.Delay(1500);          // дать странице осесть
+                        await Exec(ClearComposerScript); // снять восстановленный из сессии черновик
+                    }
                 }
             };
             _web.CoreWebView2.Navigate("https://chatgpt.com/");
@@ -350,7 +360,7 @@ internal sealed class MainForm : Form
             {
                 _lastText = text; // запоминаем для повторной вставки (Ctrl+Win+Alt)
                 bool ok = Injector.Inject(text, target, withY);
-                Win32.MessageBeep(ok ? 0u : 0xFFFFFFFF);
+                Win32.FeedbackBeep(ok);
                 OverlaySet(ok ? StatusOverlay.Phase.Done : StatusOverlay.Phase.Error, ok ? null : Lang.T("err.paste_failed"));
                 Log(Lang.T("log.result", text));   // полный текст; обрезку делает само окно по правому краю
                 Diag.Write($"inject ok={ok} window=«{Win32.GetWindowTitle(target)}»" + (withY ? " (+buffer)" : ""));
@@ -386,7 +396,7 @@ internal sealed class MainForm : Form
         IntPtr target = Win32.GetForegroundWindow();
         if (string.IsNullOrEmpty(_lastText))
         {
-            Win32.MessageBeep(0xFFFFFFFF);
+            Win32.FeedbackBeep(false);
             StatusOverlay.Show(StatusOverlay.Phase.Error, target);
             StatusOverlay.Set(StatusOverlay.Phase.Error, Lang.T("err.no_text"));
             Diag.Write("повтор: пусто (ещё не было диктовки)");
@@ -394,7 +404,7 @@ internal sealed class MainForm : Form
         }
         // Модификаторы уже отпущены (жест ловится на release) → синтез Ctrl+V чистый.
         bool ok = Injector.Inject(_lastText, target, keepInClipboard: false);
-        Win32.MessageBeep(ok ? 0u : 0xFFFFFFFF);
+        Win32.FeedbackBeep(ok);
         StatusOverlay.Show(ok ? StatusOverlay.Phase.Done : StatusOverlay.Phase.Error, target);
         if (!ok) StatusOverlay.Set(StatusOverlay.Phase.Error, Lang.T("err.not_pasted"));
         Diag.Write($"повтор → «{Trunc(_lastText)}» ok={ok} в «{Win32.GetWindowTitle(target)}»");
@@ -449,19 +459,30 @@ internal sealed class MainForm : Form
         var host = new Panel { Dock = DockStyle.Fill };
         host.Controls.Add(_log); // _log уже настроен (Dock=Fill)
 
-        // Панель помощи — скрыта; по «?» накрывает лог списком комбинаций.
+        // Панель помощи — скрыта; по «?» накрывает лог. Внутри read-only многострочное
+        // поле: само скроллит/переносит, если справки больше, чем влезает в полосу лога.
         var help = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = Color.FromArgb(30, 30, 34),
-            Padding = new Padding(18, 14, 18, 14),
+            // Отступ ТОЛЬКО слева (текст не липнет к краю). Право/верх/низ = 0, чтобы скролл-балка
+            // вложенного поля прилегала ко всем стенкам окна (как у лога), без промежутков.
+            Padding = new Padding(14, 0, 0, 0),
             Visible = false,
         };
-        help.Controls.Add(new Label
+        help.Controls.Add(new TextBox
         {
             Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            BorderStyle = BorderStyle.None,
+            BackColor = Color.FromArgb(30, 30, 34),
             ForeColor = Color.Gainsboro,
-            Font = new Font("Segoe UI", 10.5f),
+            Font = new Font("Segoe UI", 10f),
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = true,
+            TabStop = false,
+            Cursor = Cursors.Default,
             Text = HotkeyHelpText(),
         });
         host.Controls.Add(help);
@@ -487,6 +508,7 @@ internal sealed class MainForm : Form
         {
             help.Visible = !help.Visible;
             btn.Text = help.Visible ? "✕" : "?";   // открыто → крестик, закрыто → вопрос
+            _logRow.Height = help.Visible ? LogRowHelpPx : LogRowNormalPx; // под справку лог повыше
             if (help.Visible) help.BringToFront();
             btn.BringToFront();
         };
@@ -502,11 +524,15 @@ internal sealed class MainForm : Form
     private static string HotkeyHelpText()
     {
         string nl = Environment.NewLine;
-        return Lang.T("help.title") + nl + nl
+        return nl + Lang.T("help.title") + nl + nl   // пустая строка сверху — отступ от края
             + "•  " + Lang.T("help.dictate") + nl
             + "•  " + Lang.T("help.keepbuf") + nl
             + "•  " + Lang.T("help.repaste") + nl
-            + "•  " + Lang.T("help.cancel");
+            + "•  " + Lang.T("help.cancel") + nl + nl
+            + Lang.T("help.flags_title") + nl
+            + "•  " + Lang.T("help.flag_lang") + nl
+            + "•  " + Lang.T("help.flag_tray") + nl
+            + "•  " + Lang.T("help.flag_nobeep");
     }
 
     // --------------------------- JS-скрипты ---------------------------
@@ -518,6 +544,20 @@ internal sealed class MainForm : Form
   var b = [...document.querySelectorAll('button')].find(x =>
     /start dictation|diktat starten|начать диктов/i.test(x.getAttribute('aria-label') || ''));
   return b ? 'ready' : 'no';
+})()
+""";
+
+    // Прячем через CSS (правило живёт в <head>, переживает перерисовки React, узел не удаляем):
+    //  (1) блок СРАЗУ ЗА #thread-bottom — лишние кнопки, что прыгают при сужении окна;
+    //  (2) элемент ПЕРЕД #thread-bottom-container (контейнер композера) — заголовок, он мешает.
+    // *:has(+ X) = предыдущий сосед X. Идемпотентно.
+    private const string HideExtrasScript = """
+(function () {
+  var id = 'gptgrabber-hide-extras';
+  var s = document.getElementById(id);
+  if (!s) { s = document.createElement('style'); s.id = id; (document.head || document.documentElement).appendChild(s); }
+  s.textContent = '#thread-bottom + div, *:has(+ #thread-bottom-container) { display: none !important; }';
+  return 'ok';
 })()
 """;
 

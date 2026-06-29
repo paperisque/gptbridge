@@ -2,6 +2,11 @@
 
 Единый источник правды для C#-сервера, Firefox-расширения и сетевого клиента. Меняем формат — правим **этот файл**, потом все стороны (`WsServer.OnMessageAsync` + `WsClient.OnMessage` + обработчики в `content.js`/`background.js`).
 
+> **Этот контракт — для Firefox-версии.** Автономная версия на WebView2 (`poc-webview2/`,
+> GPT Grabber) WebSocket НЕ использует: она управляет встроенной страницей ChatGPT напрямую,
+> инъекцией JS из C# (`CoreWebView2.ExecuteScriptAsync`). См. раздел «WebView2-версия» внизу
+> и [CLAUDE.md](../CLAUDE.md).
+
 ## Транспорт
 
 - WebSocket поверх HTTP, без TLS.
@@ -143,3 +148,25 @@
 | `busy`   | сервер → ctrl| отказ старта — занято другим владельцем          |
 
 Добавляя их, обнови таблицы выше и обработчики в `WsServer.cs` / `WsClient.cs` / `content.js` / `background.js`.
+
+## WebView2-версия (GPT Grabber): без WS, прямая инъекция JS
+
+Автономное приложение `poc-webview2/` встраивает ChatGPT через WebView2 и управляет
+страницей не по WebSocket, а вызывая JS прямо в ней (`ExecuteScriptAsync`) в нужные
+моменты. Эквивалент «сообщений» здесь — набор скриптов в `MainForm.cs`:
+
+| операция               | что делает                                                            |
+|------------------------|-----------------------------------------------------------------------|
+| `StartReadyScript`     | есть ли кнопка «Start dictation» (готовность к старту)                 |
+| `ClickStartScript`     | клик «Start dictation» (старт записи)                                  |
+| `DictationStateScript` | идёт ли запись (есть `Submit`/`Cancel dictation` или исчез композер)   |
+| `SubmitScript`         | клик «Submit dictation» (финал → распознавание)                       |
+| `CancelScript`         | клик «Cancel dictation» (отбой без распознавания)                     |
+| `ComposerReadScript`   | прочитать распознанный текст из `#prompt-textarea`                     |
+| `ClearComposerScript`  | очистить композер (фокус + выделить всё + `execCommand('delete')`)     |
+| `HideExtrasScript`     | вкрутить в `<head>` CSS, прячущий лишние блоки-соседи `#thread-bottom` |
+
+Селекторы кнопок ChatGPT — те же, что у Firefox-версии (см. таблицу «Кнопки ChatGPT»), и
+так же матчатся мультиязычно (EN/DE/RU): aria-label локализован. Захват окна-цели и Ctrl+V
+приложение делает локально само (как локальный контроллер у сервера) — сети тут нет, поэтому
+ни `hello`/`start`/`stop`/`inject`, ни ролей/владельца сессии в этой версии нет.

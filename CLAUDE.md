@@ -2,6 +2,11 @@
 
 ТЗ и карта проекта для ассистента. Читать перед любой правкой. Язык общения и комментариев в коде — **русский**.
 
+> **В репозитории ДВЕ версии.** §1–§7 описывают исходную **Firefox-версию**
+> (`server-csharp/VoiceBridge` + расширение). Новая автономная **версия на WebView2**
+> (`poc-webview2/`, «GPT Grabber»: встроенный ChatGPT, без Firefox/расширения/сети) и её
+> установщик — в **§8**. Грабли §6 (DOM ChatGPT, вставка, фокус, индикатор) переиспользованы и там.
+
 ## 1. Что это и зачем
 
 Голосовой мост: **диктовка в табе ChatGPT (Firefox) → текст автоматически вставляется в активное окно** (любое — VS Code, редактор, мессенджер). Идея — использовать качественную диктовку ChatGPT как системный голосовой ввод куда угодно.
@@ -33,7 +38,11 @@ Gptgraber/
 ├─ package.json              web-ext: lint/build/sign расширения (путь AMO); артефакты → dist/
 ├─ tools/build-xpi.ps1       упаковка расширения в .xpi (релизный артефакт с реальной версией)
 ├─ tools/update-ext.ps1      быстрый dev-цикл: авто-версия + сборка + установка в Firefox одной командой
-├─ docs/PROTOCOL.md          контракт WS (источник правды по сообщениям)
+├─ tools/build-installer.ps1 сборка установщика WebView2-версии одной командой (§8)
+├─ tools/make-icon.ps1       icons/ico2.png → installer/app.ico (иконка установщика/ярлыков, §8)
+├─ installer/GptGrabber.iss  Inno Setup-скрипт установщика WebView2-версии (§8)
+├─ poc-webview2/             АВТОНОМНАЯ версия на WebView2 («GPT Grabber») — карта и решения в §8
+├─ docs/PROTOCOL.md          контракт WS (источник правды; только Firefox-версия)
 ├─ server-csharp/VoiceBridge/  C#-приложение (.NET 10, net10.0-windows, console) — один exe, два режима
 │  ├─ Program.cs             entry point + разбор аргументов: режим сервера (по умолч.) или клиента (--connect), --no-autolaunch, --no-overlay/--overlay-compact
 │  ├─ ServerApp.cs           режим СЕРВЕРА (хаб): цикл сообщений Win32, локальный контроллер, владелец сессии, маршрутизация текста, машина Idle→Preparing→Recording
@@ -160,3 +169,36 @@ dotnet run -- --lang ru               # язык надписей (en|de|ru); п
 - Контракт WS меняем ТОЛЬКО синхронно: `docs/PROTOCOL.md` + `WsServer.OnMessageAsync` + `WsClient.OnMessage` + обработчики в `content.js`/`background.js`.
 - Проверять после изменений: `dotnet build` для C#, `node --check` для JS.
 - В гит не коммитим `bin/`, `obj/`, `.vs/` (см. `.gitignore`).
+
+## 8. Автономная версия на WebView2 («GPT Grabber»)
+
+Отдельное самодостаточное приложение в `poc-webview2/` (проект `WebView2Poc`, продукт «GPT Grabber»). Встраивает ChatGPT через **WebView2** (Chromium) и управляет страницей **в процессе** (инъекция JS), без внешнего Firefox, расширения и сетевого хаба. Переиспользует идеи Firefox-версии: хук хоткея, вставку (Injector/Clipboard), индикатор-пилюлю (StatusOverlay), грабли §6.2/§6.3/§6.4. WS-протокол НЕ используется (PROTOCOL.md → раздел «WebView2-версия»).
+
+```
+poc-webview2/
+├─ Program.cs    entry: скрытие консоли (перезапуск без окна), single-instance, парс --lang/--tray/--no-beep
+├─ MainForm.cs   окно (WebView2 сверху + лог снизу), трей, машина Idle→Starting→Recording→Stopping, JS-скрипты, справка «?»
+├─ Overlay.cs    индикатор-«пилюля» (перенос StatusOverlay; процесс DPI-unaware)
+├─ Hotkey.cs     низкоуровневый хук Ctrl+Win / +Y(скан 0x2C) / +Alt; постит в HWND формы (WM_APP_TOGGLE/REPASTE)
+├─ Interop.cs    P/Invoke: хук, SendInput(Ctrl+V), буфер, FeedbackBeep(Beep), single-instance (RegisterWindowMessage/HWND_BROADCAST)
+├─ Lang.cs       en/de/ru, словари в КОДЕ (не JSON); --lang перекрывает систему
+├─ Diag.cs       данные рядом с программой: AppContext.BaseDirectory/data (профиль WebView2 + poc.log)
+├─ icons/        ico2.png — источник иконки (make-icon.ps1); прочее — наброски (в гит попали)
+└─ fonts/        приватные .ttf для подписи пилюли (как у сервера; в гит не коммитим)
+```
+
+### Ключевые решения (доп. к §6)
+
+1. **SAC и окно консоли.** Свой apphost не собираем (`UseAppHost=false`, §6.14) → запуск через `dotnet.exe` (консольный хост). На Win11 с Windows Terminal `ShowWindow(GetConsoleWindow())` не прячет окно (GetConsoleWindow отдаёт скрытую псевдоконсоль, видимое окно держит Terminal). Решение: приложение на старте **перезапускает себя без окна** (`Process.Start` + `CreateNoWindow`), пометив дочерний процесс env `GPTGRABBER_NOCONSOLE` (чтобы не зациклить), и выходит. Короткое мелькание при старте неустранимо без подписанного exe.
+2. **Один экземпляр.** Именованный мьютекс `Local\GptGrabber.SingleInstance`; держит его только реальный экземпляр (после relaunch-для-консоли создаёт дочерний). Второй запуск шлёт первому broadcast `RegisterWindowMessage("GptGrabber.ShowExistingInstance.v1")` → `MainForm.WndProc` → разворот из трея (доходит и до скрытого окна). Гонку решает `createdNew`.
+3. **Данные рядом с программой** (`Diag.Dir = AppContext.BaseDirectory + "data"`): профиль ChatGPT (WebView2) и лог — в `{папка}\data`. Установленная версия → `%LOCALAPPDATA%\GptGrabber\data` (per-user, писемо); Debug → `bin\…\data`. Деинсталлятор сносит. Для per-machine пришлось бы вернуть в %LOCALAPPDATA% (Program Files не писемо).
+4. **Управление страницей — инъекция JS** (`ExecuteScriptAsync`), не WS. Скрипты-операции — в PROTOCOL.md (раздел WebView2). Селекторы/грабли DOM те же (§6.1/§6.2/§6.19). §6.11/§6.15 (фокус окна/таба для микрофона) НЕ нужны: захват идёт и в свёрнутом окне (WebView не «спит» благодаря `--disable-background-timer-throttling …`), активного «таба» нет.
+5. **Скрытие лишних блоков ChatGPT** (`HideExtrasScript`): CSS-правило в `<head>` (живёт после перерисовок React — узлы НЕ удаляем) прячет соседей `#thread-bottom`: блок-после (`#thread-bottom + div`) и заголовок-до (`*:has(+ #thread-bottom-container)`).
+6. **Звук вставки** (`Win32.FeedbackBeep`): свой тон через kernel32 `Beep` на фоновом потоке (системный `MessageBeep` звучал «как ошибка»). `--no-beep` глушит.
+7. **Прочее:** окно компактное 740×550; верхний отступ текста в логе/справке — стартовой пустой строкой (скролл и кнопку «?» не трогает); справка по «?» — прокручиваемое поле, полоса лога при открытии справки временно растёт.
+
+### Установщик (Inno Setup)
+
+`installer/GptGrabber.iss` + сборка одной командой `tools/build-installer.ps1`: publish framework-dependent → вложенный **портативный .NET 10 runtime** (NETCore.App **и** WindowsDesktop.App — нужен из-за WinForms; берём из локального `C:\Program Files\dotnet`) → бутстраппер **Edge WebView2 Runtime** (кэш `tools/cache/`, ставится только если рантайма нет) → ISCC. Свойства: per-user в `%LOCALAPPDATA%\GptGrabber`, без админа, БЕЗ шагов мастера (`DisableWelcomePage/DirPage/ReadyPage`, `ShowLanguageDialog=no`); запуск через вложенный подписанный `dotnet.exe` + DLL (SAC); `[UninstallDelete]` сносит `{app}\data`. Иконка — `installer/app.ico` (генерится `make-icon.ps1` из `icons/ico2.png`). Версия — из `package.json`. Выход — `dist/GptGrabber-Setup-<ver>.exe`.
+
+**Грабли установщика:** (а) `.ps1` и `.iss` с кириллицей сохранять в UTF-8 **с BOM** (PowerShell 5.1 и Inno иначе читают как ANSI → кракозябры/парс-ошибки); (б) в Pascal-комментариях `.iss` нельзя `{`/`}` (обрывают комментарий); (в) `Get-Content -Raw` в PS5.1 читает UTF-8 как ANSI — файлы (манифест и т.п.) читаем через `[System.IO.File]::ReadAllText`; (г) большой `setup.exe` (~52 МБ, с рантаймом) коммитим в git осознанно — растит историю.

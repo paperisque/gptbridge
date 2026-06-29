@@ -87,6 +87,31 @@ internal static partial class Win32
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] p, int cb);
     [DllImport("user32.dll")] public static extern bool MessageBeep(uint t);
+
+    [DllImport("kernel32.dll")] private static extern bool Beep(uint dwFreq, uint dwDuration);
+
+    public static bool BeepEnabled = true; // --no-beep глушит звуковой отклик
+    /// <summary>Свой звуковой отклик (НЕ системный MessageBeep — тот звучит «как ошибка» и сбивает):
+    /// успех — короткий ВОСХОДЯЩИЙ тон (позитивный), ошибка — низкий короткий. На фоновом потоке,
+    /// чтобы не блокировать вставку. Молчит при --no-beep.</summary>
+    public static void FeedbackBeep(bool ok)
+    {
+        if (!BeepEnabled) return;
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                if (ok)
+                {
+                    Beep(1175, 110);    // тон, что был вторым (D6) — теперь первый
+                    Thread.Sleep(90);   // ощутимый промежуток между бик-бик
+                    Beep(784, 200);     // тон, что был первым (G5) — теперь второй, низкий → мягче
+                }
+                else { Beep(440, 200); } // низкий короткий — ошибка
+            }
+            catch { /* нет аудиоустройства/занято — не критично */ }
+        });
+    }
     [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")] public static extern bool SystemParametersInfo(uint a, uint b, ref IntPtr pv, uint f);
     [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr pv, uint f);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr h);
@@ -162,8 +187,8 @@ internal static class Injector
 
     public static bool Inject(string text, IntPtr target, bool keepInClipboard)
     {
-        if (target == IntPtr.Zero || !Win32.IsWindow(target)) { Win32.MessageBeep(0xFFFFFFFF); return false; }
-        if (string.IsNullOrEmpty(text)) { Win32.MessageBeep(0xFFFFFFFF); return false; }
+        if (target == IntPtr.Zero || !Win32.IsWindow(target)) { Win32.FeedbackBeep(false); return false; }
+        if (string.IsNullOrEmpty(text)) { Win32.FeedbackBeep(false); return false; }
 
         string? previous = Clip.SetUnicodeText(text, out bool ok);
         if (!ok) return false;

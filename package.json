@@ -1,6 +1,6 @@
 {
   "name": "gptgraber-extension-tools",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "Сборка, линт и подпись Firefox-расширения Gptgraber через web-ext.",
   "scripts": {

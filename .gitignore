@@ -21,6 +21,9 @@ web-ext-artifacts/
 # Сам инсталлятор кладётся в dist/ (уже игнорируется выше).
 tools/cache/
 
+# ---- Отстойник: черновики/мусор вне git (пригодится позже) ----
+tmp/
+
 # ---- Claude Code (личные настройки) ----
 .claude/settings.local.json
 .claude/beep-disabled

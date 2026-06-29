@@ -84,6 +84,10 @@ internal static class Program
         bool startInTray = Environment.GetCommandLineArgs()
             .Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase));
 
+        // --no-beep: глушим звуковой отклик при вставке/ошибке (звук «блы» на успешной вставке).
+        Win32.BeepEnabled = !Environment.GetCommandLineArgs()
+            .Any(a => a.Equals("--no-beep", StringComparison.OrdinalIgnoreCase));
+
         try
         {
             Application.Run(new MainForm(startInTray));

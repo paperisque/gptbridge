@@ -64,6 +64,10 @@ internal static class Lang
         ["help.keepbuf"] = "Ctrl+Win+Y — same, and the text also stays in the clipboard",
         ["help.repaste"] = "Ctrl+Win+Alt — paste the last recognized text again",
         ["help.cancel"] = "Ctrl+Win during prepare/recognize — cancel",
+        ["help.flags_title"] = "Command-line flags (after the DLL path):",
+        ["help.flag_lang"] = "--lang en|de|ru — interface language (overrides the system one)",
+        ["help.flag_tray"] = "--tray — start minimized to the tray",
+        ["help.flag_nobeep"] = "--no-beep — turn off the sound on paste",
     };
 
     private static readonly Dictionary<string, string> De = new()
@@ -96,6 +100,10 @@ internal static class Lang
         ["help.keepbuf"] = "Ctrl+Win+Y — dasselbe, Text bleibt zusätzlich in der Zwischenablage",
         ["help.repaste"] = "Ctrl+Win+Alt — letzten erkannten Text erneut einfügen",
         ["help.cancel"] = "Ctrl+Win während Vorbereitung/Erkennung — Abbrechen",
+        ["help.flags_title"] = "Startparameter (nach dem DLL-Pfad):",
+        ["help.flag_lang"] = "--lang en|de|ru — Sprache der Oberfläche (überschreibt die Systemsprache)",
+        ["help.flag_tray"] = "--tray — minimiert in den Infobereich starten",
+        ["help.flag_nobeep"] = "--no-beep — Ton beim Einfügen ausschalten",
     };
 
     private static readonly Dictionary<string, string> Ru = new()
@@ -128,5 +136,9 @@ internal static class Lang
         ["help.keepbuf"] = "Ctrl+Win+Y — то же, и текст остаётся в буфере обмена",
         ["help.repaste"] = "Ctrl+Win+Alt — снова вставить последний распознанный текст",
         ["help.cancel"] = "Ctrl+Win в фазе подготовки/распознавания — отмена",
+        ["help.flags_title"] = "Параметры запуска (после пути к DLL):",
+        ["help.flag_lang"] = "--lang en|de|ru — язык интерфейса (перекрывает системный)",
+        ["help.flag_tray"] = "--tray — запуститься свёрнутым в трей",
+        ["help.flag_nobeep"] = "--no-beep — выключить звук при вставке",
     };
 }

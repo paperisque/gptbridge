@@ -10,7 +10,7 @@
 ; ============================================================================
 
 #define AppName "GPT Grabber"
-#define AppPublisher "B-performance"
+#define AppPublisher "Radiy Sladkov"
 #define ExeRel "dotnet\dotnet.exe"
 #define DllName "WebView2Poc.dll"
 
