@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>WebView2Poc</AssemblyName>
+    <RootNamespace>WebView2Poc</RootNamespace>
+    <!-- SAC блокирует неподписанный apphost (см. основной проект, CLAUDE.md §6.14):
+         exe не собираем, запуск через доверенный dotnet (dotnet run). -->
+    <UseAppHost>false</UseAppHost>
+    <!-- WebView2 тащит и WinForms-, и WPF-обёртку; WPF-овская цепляет другую WindowsBase.
+         WPF мы не используем — конфликт версий безобиден, глушим шум. -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4022.49" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Приватные шрифты индикатора (StatusOverlay.PickFont) — те же файлы, что в сервере;
+         без них пилюля откатывалась на системный Roboto. В гит не коммитим (.gitignore):
+         Google Sans проприетарный. Своя копия — сервер при этом не трогаем. -->
+    <None Update="fonts\*.ttf" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fonts\*.otf" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

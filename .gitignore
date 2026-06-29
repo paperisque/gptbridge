@@ -13,9 +13,13 @@
 
 # ---- Node / web-ext (сборка и подпись расширения) ----
 node_modules/
-dist/
+dist/*.cmd
 web-ext-artifacts/
-*.xpi
+# *.xpi
+
+# ---- Установщик (Inno Setup): кэш загружаемого WebView2-бутстраппера ----
+# Сам инсталлятор кладётся в dist/ (уже игнорируется выше).
+tools/cache/
 
 # ---- Claude Code (личные настройки) ----
 .claude/settings.local.json
@@ -24,6 +28,8 @@ web-ext-artifacts/
 # ---- Приватные шрифты индикатора (могут быть проприетарными — не коммитим) ----
 server-csharp/VoiceBridge/fonts/*.ttf
 server-csharp/VoiceBridge/fonts/*.otf
+poc-webview2/fonts/*.ttf
+poc-webview2/fonts/*.otf
 
 # ---- Не для публичного репозитория ----
 # Демо-ролики (тяжёлые; решим позже, чем делиться) и внутренняя «память» ассистента.

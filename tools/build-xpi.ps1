@@ -1,4 +1,4 @@
-# Упаковка расширения Firefox в .xpi (zip с manifest.json в КОРНЕ архива).
+﻿# Упаковка расширения Firefox в .xpi (zip с manifest.json в КОРНЕ архива).
 #
 # Для ПОСТОЯННОЙ установки в Firefox Developer Edition / ESR / Nightly с отключённой
 # проверкой подписи (about:config → xpinstall.signatures.required = false). На обычном
@@ -15,7 +15,8 @@ $src  = Join-Path $root 'extension-firefox'
 $dist = Join-Path $root 'dist'
 
 # Версию берём из манифеста — чтобы имя .xpi совпадало с версией расширения.
-$manifest = Get-Content (Join-Path $src 'manifest.json') -Raw | ConvertFrom-Json
+# Читаем как UTF-8 (Get-Content -Raw в PS5.1 — ANSI); сам файл ниже копируется бинарно.
+$manifest = [System.IO.File]::ReadAllText((Join-Path $src 'manifest.json')) | ConvertFrom-Json
 $version  = $manifest.version
 $xpi      = Join-Path $dist "gptgraber-$version.xpi"
 

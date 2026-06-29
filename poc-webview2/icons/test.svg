@@ -1,0 +1,30 @@
+<svg xmlns="http://w3.org" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Фон -->
+  <rect width="256" height="256" rx="48" fill="#1e1f22"/>
+  
+  <!-- Эквалайзер -->
+  <g fill="#42c864">
+    <rect x="40" y="96" width="18" height="64" rx="9"/>
+    <rect x="78" y="68" width="18" height="120" rx="9"/>
+    <rect x="116" y="84" width="18" height="88" rx="9"/>
+    <rect x="154" y="52" width="18" height="152" rx="9"/>
+    <rect x="192" y="100" width="18" height="56" rx="9"/>
+  </g>
+
+  <!-- Маска-отступ для лопаты (черный контур, чтобы отделить от палочек) -->
+  <g stroke="#1e1f22" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <line x1="70" y1="186" x2="150" y2="106" />
+    <path d="M 145 101 L 175 131 L 185 121 L 135 71 L 125 81 Z" />
+    <path d="M 60 176 L 80 196" />
+  </g>
+
+  <!-- Сама зеленая лопата -->
+  <g stroke="#42c864" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- Черенок -->
+    <line x1="70" y1="186" x2="150" y2="106" />
+    <!-- Лезвие (штык) лопаты -->
+    <path d="M 145 101 L 175 131 L 185 121 L 135 71 L 125 81 Z" fill="#1e1f22"/>
+    <!-- Ручка -->
+    <path d="M 60 176 L 80 196" />
+  </g>
+</svg>

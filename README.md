@@ -4,6 +4,8 @@
 
 You dictate by voice, ChatGPT transcribes your speech in a background Firefox tab — and on **Ctrl+Win** the text appears right in the window you are working in (VS Code, an editor, a messenger, anything). No need to switch to the browser. Over a local network the text can even be delivered to another computer.
 
+> **Note — there is also a newer, self-contained version: _GPT Grabber_ ([`poc-webview2/`](poc-webview2/README.md)).** It embeds ChatGPT directly via WebView2, so it needs **no external Firefox and no browser extension** — a single app installed in a couple of clicks. The Firefox + extension + C# hub version described below still works and is documented here.
+
 ## Why it's useful
 
 - **ChatGPT quality, everywhere.** Recognition with punctuation and support for many languages — not just inside the chat, but in any application.
