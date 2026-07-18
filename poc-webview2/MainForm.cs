@@ -1,6 +1,9 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Globalization;
+using MaterialSkin;
+using MaterialSkin.Controls;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -28,8 +31,33 @@ internal sealed class MainForm : Form
     private bool _trayStartDone;
 
     // Полоса лога снизу: обычная высота и увеличенная — под открытую справку по «?».
-    private const int LogRowNormalPx = 150, LogRowHelpPx = 250;
+    private const int LogRowNormalPx = 150, LogRowHelpPx = 310;
     private RowStyle _logRow = null!;
+
+    // Тулбар управления микрофоном (над логом): усиление/шумоподавление/громкость.
+    private const int ToolbarPx = 57;
+    private readonly MicSettings _mic = MicSettings.Load();
+    private MaterialSlider _gainBar = null!;
+    private Label _gainValue = null!;
+    private ComboBox _micCombo = null!;
+    private bool _micComboLoading;   // подавляем событие выбора во время программного заполнения
+    private Panel _helpPanel = null!;     // всплывающая справка над логом
+    private readonly ToolTip _tips = new();
+
+    // Тулбар скрыт по умолчанию, раздвигается по высоте по кнопке (плавно).
+    private RowStyle _toolbarRow = null!;
+    private bool _toolbarShown;
+    private int _toolbarTarget;
+    private System.Windows.Forms.Timer _toolbarAnim = null!;
+    // Плавающие кнопки (показать тулбар + «?») теперь ВПРЫСКИВАЮТСЯ в страницу (JS+CSS,
+    // OverlayInjectScript) — ровные бордеры/ховер, поверх контента. Тумблеры зовут ToggleToolbar/ToggleHelp
+    // через WebMessage.
+
+    /// <summary>Элемент списка микрофонов (deviceId + метка). ToString — для показа в ComboBox.</summary>
+    private sealed record MicDevice(string Id, string Label)
+    {
+        public override string ToString() => Label;
+    }
 
     // Сообщение «развернись из трея» от второго экземпляра (single-instance). Значение системно-
     // уникально по строке — одинаково во всех процессах, поэтому второй шлёт именно его (broadcast).
@@ -53,15 +81,19 @@ internal sealed class MainForm : Form
         _startInTray = startInTray;
         Text = "GPT Grabber";
         Width = 740;   // компактнее (~на треть меньше прежних 1100×820)
-        Height = 550;
+        Height = 610;   // +60 под увеличенную область справки, чтобы она не залазила на композер ChatGPT
         // При старте в трей запускаемся за экраном — инициализация (WebView/хук) проходит,
         // но без видимой вспышки окна; затем в OnShown прячемся и центрируем на будущее.
         StartPosition = startInTray ? FormStartPosition.Manual : FormStartPosition.CenterScreen;
         if (startInTray) Location = new System.Drawing.Point(-32000, -32000);
         ShowInTaskbar = false; // утилита трея; задаём ДО создания хэндла (без пересоздания окна)
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        SetupMaterialSkin();   // тёмная тема + шрифт Rubik ДО создания MaterialSkin-контролов
+
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // WebView с ChatGPT
+        _toolbarRow = new RowStyle(SizeType.Absolute, 0);          // тулбар СКРЫТ по умолчанию (раздвигается по кнопке)
+        root.RowStyles.Add(_toolbarRow);
         _logRow = new RowStyle(SizeType.Absolute, LogRowNormalPx); // лог (расширяется под открытую справку)
         root.RowStyles.Add(_logRow);
 
@@ -85,8 +117,12 @@ internal sealed class MainForm : Form
         _log.Text = Environment.NewLine;   // верхний отступ: лог начинается не вплотную к краю
 
         root.Controls.Add(_web, 0, 0);
-        root.Controls.Add(BuildLogHost(), 0, 1);
+        root.Controls.Add(BuildToolbar(), 0, 1);
+        root.Controls.Add(BuildLogHost(), 0, 2);
         Controls.Add(root);
+
+        _toolbarAnim = new System.Windows.Forms.Timer { Interval = 12 };
+        _toolbarAnim.Tick += (_, _) => AnimateToolbar();
 
         _icoWhite = BuildEqIcon(Color.White);                  // покой
         _icoOrange = BuildEqIcon(Color.FromArgb(255, 165, 0)); // готовлю/включаю микрофон
@@ -230,10 +266,23 @@ internal sealed class MainForm : Form
         {
             await _web.EnsureCoreWebView2Async();
 
+            // Перехват getUserMedia ставим ДО навигации (скрипт срабатывает при создании
+            // документа, раньше кода ChatGPT) — иначе страница успеет захватить оригинал.
+            await _web.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(MicBoostScript(_mic));
+            Diag.Write($"mic boost injected (enabled={_mic.Enabled} gain={_mic.Gain.ToString(CultureInfo.InvariantCulture)} noise={_mic.Noise})");
+
             _web.CoreWebView2.PermissionRequested += (_, e) =>
             {
                 if (e.PermissionKind == CoreWebView2PermissionKind.Microphone)
                     e.State = CoreWebView2PermissionState.Allow;
+            };
+            // Клики впрыснутых в страницу кнопок приходят сюда (WebMessage) → в UI-поток.
+            _web.CoreWebView2.WebMessageReceived += (_, e) =>
+            {
+                string msg;
+                try { msg = e.TryGetWebMessageAsString(); } catch { return; }
+                if (msg == "gg:toolbar") BeginInvoke(new Action(ToggleToolbar));
+                else if (msg == "gg:help") BeginInvoke(new Action(ToggleHelp));
             };
             _web.CoreWebView2.NavigationCompleted += async (_, e) =>
             {
@@ -241,6 +290,8 @@ internal sealed class MainForm : Form
                 if (e.IsSuccess)
                 {
                     await Exec(HideExtrasScript);    // спрятать лишний блок под #thread-bottom (CSS живёт в head)
+                    await Exec(OverlayInjectScript); // плавающие кнопки (тулбар/справка) в правом нижнем углу
+                    await PopulateMicsAsync();       // список микрофонов в тулбар (метки уже доступны — разрешение выдано)
                     if (!_firstClearDone)
                     {
                         _firstClearDone = true;
@@ -321,6 +372,7 @@ internal sealed class MainForm : Form
 
             State = LiveState.Recording;
             OverlaySet(StatusOverlay.Phase.Recording);
+            Log("micdiag: " + await Exec(MicDiagScript));   // ВРЕМЕННО: факты о перехвате getUserMedia
         }
         catch (OperationCanceledException)
         {
@@ -347,6 +399,7 @@ internal sealed class MainForm : Form
         try
         {
             Diag.Write("Submit: " + await Exec(SubmitScript));
+            Log("micdiag@stop: " + await Exec(MicDiagScript));   // ВРЕМЕННО: пиковый уровень за время записи
 
             string text = "";
             for (int i = 0; i < 40; i++)
@@ -452,8 +505,219 @@ internal sealed class MainForm : Form
     private void AppendLog(string msg) =>
         _log.AppendText($"[{DateTime.Now:HH:mm:ss.fff}] {msg}{Environment.NewLine}");
 
-    /// <summary>Низ окна: лог + кнопка «?» (всегда поверх). По «?» поверх лога всплывает
-    /// панель со списком горячих клавиш; повторный клик — скрыть.</summary>
+    /// <summary>Тулбар управления микрофоном над логом: галочки «Усиление»/«Шумоподавление»
+    /// и ползунок громкости. Есть задел под будущие кнопки (фильтры и пр.).</summary>
+    private Control BuildToolbar()
+    {
+        // Тулбар — TableLayoutPanel: один ряд, авто-колонки, всё центрируется по вертикали (Anchor=None).
+        var bar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Palette.Bg,
+            Padding = new Padding(10, 0, 10, 0),
+            ColumnCount = 5,
+            RowCount = 1,
+        };
+        bar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        for (int i = 0; i < 4; i++)
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        // Колонка-распорка справа: забирает всё лишнее место окна, иначе последняя AutoSize-колонка
+        // (блок громкости) раздувалась и центрировала панель → большой зазор после RF.
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        const AnchorStyles mid = AnchorStyles.None;   // центр по вертикали в своей ячейке
+        var gap = new Padding(0, 0, 4, 0);            // тесный зазор между контролами
+        var gapBig = new Padding(0, 0, 8, 0);         // небольшой зазор RF → блок громкости (группа сразу за RF)
+
+        // 1. Мастер вкл/выкл обработки — MaterialSwitch; пояснение — во всплывающей подсказке.
+        var master = new MaterialSwitch { Text = "", Checked = _mic.Enabled, AutoSize = true, Anchor = mid, Margin = gap };
+        _tips.SetToolTip(master, Lang.T("toolbar.enable_tip"));
+
+        // 2. Селектор микрофона (без заголовка).
+        _micCombo = new SmallComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180, Anchor = mid, Margin = gap };
+        _micCombo.Items.Add(new MicDevice("", Lang.T("toolbar.device_default")));
+        _micCombo.SelectedIndex = 0;
+        _micCombo.SelectedIndexChanged += (_, _) =>
+        {
+            if (_micComboLoading) return;
+            if (_micCombo.SelectedItem is MicDevice d)
+            {
+                _mic.DeviceId = d.Id;
+                _mic.Save();
+                PushMicSettings();   // применится при следующем старте диктовки (перезапрос микрофона)
+                Log($"микрофон выбран: {d.Label}");
+            }
+        };
+        // Открытие списка — заново перечислить устройства (могли подключить/отключить).
+        _micCombo.DropDown += async (_, _) => await PopulateMicsAsync();
+
+        // 3. Фильтр (аббревиатура) — MaterialCheckbox; после него зазор побольше (отделить от блока громкости).
+        var noise = new MaterialCheckbox { Text = Lang.T("toolbar.noise"), Checked = _mic.Noise, AutoSize = true, Anchor = mid, Margin = gapBig };
+        _tips.SetToolTip(noise, Lang.T("toolbar.noise_tip"));
+
+        // 4. Блок громкости в ОДНОЙ панели с ручными координатами: иконка «микрофон+волны»,
+        //    ползунок и значение. (TableLayoutPanel зажимает отрицательные отступы; у MaterialSlider
+        //    слева свой отступ, справа большой резерв — потому раскладываем сами.)
+        const int SliderX = 18;          // ползунок правее иконки — дорожка стартует сразу за ней (иконка «вплотную»)
+        const double ValueFrac = 0.70;   // позиция значения = доля ширины ползунка (у конца дорожки) — ТЮНИНГ
+        var volIcon = new MicGainIcon();
+        _gainBar = new MaterialSlider
+        {
+            RangeMin = 10,
+            RangeMax = 80,
+            Value = GainToBar(_mic.Gain),
+            Width = 180,
+            Height = 34,
+            UseAccentColor = true,
+            ShowText = false,
+            ShowValue = false,
+            Enabled = _mic.Enabled,   // громкость крутим только при включённом усилении
+            Location = new Point(SliderX + 4, -3),   // только ползунок: правее и выше (иконка/цифра на месте)
+        };
+        _gainValue = new Label
+        {
+            Text = GainText(_mic.Gain),
+            Font = new Font(Palette.FontName, 9f),   // значение в ~1.5× мельче контролов
+            ForeColor = Palette.Text,
+            BackColor = Palette.Bg,
+            AutoSize = true,
+        };
+        // Панель на 1px выше центра ячейки: Margin снизу 2 → Anchor=None сдвигает вверх ~1px.
+        // Панель шире ползунка (запас справа), чтобы индикатор не обрезался; лишнее место забирает колонка-распорка.
+        var gainGroup = new Panel { Size = new Size(SliderX + 320, 34), BackColor = Palette.Bg, Anchor = mid, Margin = new Padding(4, 0, 4, 2) };  // +4px вправо всей группе
+        void PlaceGainIcon() => volIcon.Location = new Point(0, (gainGroup.Height - volIcon.Height) / 2);
+        void PlaceGainValue() => _gainValue.Location =   // индикатор: +55px вправо, +1px вниз
+            new Point(SliderX + (int)(_gainBar.Width * ValueFrac) + 55, (gainGroup.Height - _gainValue.Height) / 2 + 1);
+        gainGroup.Controls.Add(_gainBar);
+        gainGroup.Controls.Add(volIcon);       // иконка поверх пустого левого отступа ползунка
+        gainGroup.Controls.Add(_gainValue);    // значение поверх пустого правого резерва ползунка
+        volIcon.BringToFront();
+        _gainValue.BringToFront();
+        PlaceGainIcon();
+        PlaceGainValue();
+        _gainValue.TextChanged += (_, _) => PlaceGainValue();
+
+        master.CheckedChanged += (_, _) =>
+        {
+            _mic.Enabled = master.Checked;
+            _gainBar.Enabled = master.Checked;
+            _mic.Save();
+            PushMicSettings();
+        };
+        noise.CheckedChanged += (_, _) =>
+        {
+            _mic.Noise = noise.Checked;
+            _mic.Save();
+            PushMicSettings();
+        };
+        _gainBar.onValueChanged += (_, _) =>
+        {
+            _mic.Gain = _gainBar.Value / 10.0;
+            _gainValue.Text = GainText(_mic.Gain);
+            PushMicSettings();          // усиление меняется на лету (gain-нода уже в графе)
+        };
+        _gainBar.MouseUp += (_, _) => _mic.Save();   // на диск — по отпусканию, не на каждый тик
+
+        bar.Controls.Add(master, 0, 0);
+        bar.Controls.Add(_micCombo, 1, 0);
+        bar.Controls.Add(noise, 2, 0);
+        bar.Controls.Add(gainGroup, 3, 0);
+        return bar;
+    }
+
+    /// <summary>Показать/скрыть справку (панель над логом). Зовётся впрыснутой в страницу кнопкой «?».</summary>
+    private void ToggleHelp()
+    {
+        _helpPanel.Visible = !_helpPanel.Visible;
+        _logRow.Height = _helpPanel.Visible ? LogRowHelpPx : LogRowNormalPx; // под справку лог повыше
+        if (_helpPanel.Visible) _helpPanel.BringToFront();
+    }
+
+    /// <summary>Тёмная тема MaterialSkin + шрифт Rubik (вшитый Roboto подменяем рефлексией).</summary>
+    private void SetupMaterialSkin()
+    {
+        var mgr = MaterialSkinManager.Instance;
+        mgr.Theme = MaterialSkinManager.Themes.DARK;
+        mgr.ColorScheme = new ColorScheme(
+            Primary.BlueGrey800, Primary.BlueGrey900, Primary.BlueGrey700,
+            Accent.LightBlue200, TextShade.WHITE);
+        MaterialFonts.Apply(Palette.FontName, 13);
+    }
+
+    /// <summary>Показать/скрыть тулбар — плавно по высоте (0 ↔ ToolbarPx).</summary>
+    private void ToggleToolbar()
+    {
+        _toolbarShown = !_toolbarShown;
+        _toolbarTarget = _toolbarShown ? ToolbarPx : 0;
+        _toolbarAnim.Start();
+    }
+
+    private void AnimateToolbar()
+    {
+        int h = (int)_toolbarRow.Height;
+        const int step = 8;
+        if (h < _toolbarTarget) h = Math.Min(_toolbarTarget, h + step);
+        else if (h > _toolbarTarget) h = Math.Max(_toolbarTarget, h - step);
+        _toolbarRow.Height = h;
+        if (h == _toolbarTarget) _toolbarAnim.Stop();
+    }
+
+    /// <summary>Заполнить список микрофонов из страницы (enumerateDevices) с сохранением выбора.</summary>
+    private async Task PopulateMicsAsync()
+    {
+        await Exec(EnumMicsKickScript);            // запустить асинхронное перечисление
+        string json = "";
+        for (int i = 0; i < 20; i++)               // опрашивать результат до готовности (~3 с)
+        {
+            json = await Exec(MicListReadScript);
+            if (!string.IsNullOrEmpty(json) && json != "null" && json != "\"\"") break;
+            await Task.Delay(150);
+        }
+        Diag.Write("enum raw: " + json);           // ВРЕМЕННО: что реально вернул enumerateDevices
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("mics", out var mics) || mics.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return;
+
+            _micComboLoading = true;
+            _micCombo.Items.Clear();
+            _micCombo.Items.Add(new MicDevice("", Lang.T("toolbar.device_default")));
+            int selIdx = _mic.DeviceId.Length == 0 ? 0 : -1;
+            foreach (var m in mics.EnumerateArray())
+            {
+                string id = m.TryGetProperty("id", out var i) ? (i.GetString() ?? "") : "";
+                string label = m.TryGetProperty("label", out var l) ? (l.GetString() ?? id) : id;
+                if (id.Length == 0) continue;
+                _micCombo.Items.Add(new MicDevice(id, label));
+                if (id == _mic.DeviceId) selIdx = _micCombo.Items.Count - 1;
+            }
+            _micCombo.SelectedIndex = selIdx >= 0 ? selIdx : 0;   // выбранного устройства нет → «По умолчанию»
+            _micComboLoading = false;
+        }
+        catch (Exception ex) { _micComboLoading = false; Diag.Write("PopulateMics: " + ex.Message + " | " + json); }
+    }
+
+    private static int GainToBar(double g) => Math.Clamp((int)Math.Round(g * 10), 10, 80);
+    private static string GainText(double g) => g.ToString("0.0", CultureInfo.InvariantCulture) + "×";
+
+    /// <summary>Пробросить текущие настройки микрофона в страницу. Gain применяется на лету
+    /// (нода уже в графе); enabled/noise вступят в силу при следующем запросе микрофона.</summary>
+    private void PushMicSettings()
+    {
+        string en = _mic.Enabled ? "true" : "false";
+        string ns = _mic.Noise ? "true" : "false";
+        string g = _mic.Gain.ToString(CultureInfo.InvariantCulture);
+        string dev = System.Text.Json.JsonSerializer.Serialize(_mic.DeviceId); // строка с кавычками, экранирована
+        string js = "(function(){var m=window.__ggMic||(window.__ggMic={});"
+            + "m.enabled=" + en + ";m.gain=" + g + ";m.noise=" + ns + ";m.deviceId=" + dev + ";"
+            + "if(window.__ggMicGain){try{window.__ggMicGain.gain.value=" + g + ";}catch(e){}}"
+            + "return 'ok';})()";
+        _ = Exec(js);
+    }
+
+    /// <summary>Низ окна: лог + скрытая панель справки (её включает кнопка «?» с тулбара).</summary>
     private Panel BuildLogHost()
     {
         var host = new Panel { Dock = DockStyle.Fill };
@@ -461,7 +725,7 @@ internal sealed class MainForm : Form
 
         // Панель помощи — скрыта; по «?» накрывает лог. Внутри read-only многострочное
         // поле: само скроллит/переносит, если справки больше, чем влезает в полосу лога.
-        var help = new Panel
+        _helpPanel = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = Color.FromArgb(30, 30, 34),
@@ -470,7 +734,7 @@ internal sealed class MainForm : Form
             Padding = new Padding(14, 0, 0, 0),
             Visible = false,
         };
-        help.Controls.Add(new TextBox
+        _helpPanel.Controls.Add(new TextBox
         {
             Dock = DockStyle.Fill,
             Multiline = true,
@@ -485,38 +749,7 @@ internal sealed class MainForm : Form
             Cursor = Cursors.Default,
             Text = HotkeyHelpText(),
         });
-        host.Controls.Add(help);
-
-        // Круглая кнопка «?» в правом верхнем углу — всегда поверх лога/панели помощи.
-        var btn = new Button
-        {
-            Text = "?",
-            Size = new Size(26, 26),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = Color.FromArgb(50, 50, 58),
-            ForeColor = Color.Gainsboro,
-            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-            Anchor = AnchorStyles.Top | AnchorStyles.Right,
-            TabStop = false,
-            Cursor = Cursors.Hand,
-        };
-        btn.FlatAppearance.BorderSize = 0;
-        var round = new System.Drawing.Drawing2D.GraphicsPath();
-        round.AddEllipse(0, 0, btn.Width - 1, btn.Height - 1);
-        btn.Region = new Region(round);
-        btn.Click += (_, _) =>
-        {
-            help.Visible = !help.Visible;
-            btn.Text = help.Visible ? "✕" : "?";   // открыто → крестик, закрыто → вопрос
-            _logRow.Height = help.Visible ? LogRowHelpPx : LogRowNormalPx; // под справку лог повыше
-            if (help.Visible) help.BringToFront();
-            btn.BringToFront();
-        };
-        host.Controls.Add(btn);
-        // Держим кнопку ЛЕВЕЕ вертикального скролла лога — резервируем его ширину.
-        host.Resize += (_, _) => btn.Location =
-            new Point(host.ClientSize.Width - btn.Width - 8 - SystemInformation.VerticalScrollBarWidth, 8);
-        btn.BringToFront();
+        host.Controls.Add(_helpPanel);
         return host;
     }
 
@@ -529,6 +762,8 @@ internal sealed class MainForm : Form
             + "•  " + Lang.T("help.keepbuf") + nl
             + "•  " + Lang.T("help.repaste") + nl
             + "•  " + Lang.T("help.cancel") + nl + nl
+            + Lang.T("help.mic_title") + nl
+            + "•  " + Lang.T("help.mic_desc") + nl + nl
             + Lang.T("help.flags_title") + nl
             + "•  " + Lang.T("help.flag_lang") + nl
             + "•  " + Lang.T("help.flag_tray") + nl
@@ -557,6 +792,48 @@ internal sealed class MainForm : Form
   var s = document.getElementById(id);
   if (!s) { s = document.createElement('style'); s.id = id; (document.head || document.documentElement).appendChild(s); }
   s.textContent = '#thread-bottom + div, *:has(+ #thread-bottom-container) { display: none !important; }';
+  return 'ok';
+})()
+""";
+
+    // Плавающие круглые кнопки в правом нижнем углу страницы (поверх контента): «микрофон+волны»
+    // (показать/скрыть тулбар) и «?» (справка). CSS даёт ровные бордеры/ховер (Region в WinForms не сглаживался).
+    // Клик → postMessage → C# (WebMessageReceived). Идемпотентно + self-heal на случай перерисовок React.
+    private const string OverlayInjectScript = """
+(function () {
+  var MIC = '<svg width="20" height="16" viewBox="0 0 32 24" fill="none" xmlns="http://www.w3.org/2000/svg">'
+    + '<rect x="3" y="3" width="7" height="12" rx="3.5" fill="currentColor"/>'
+    + '<path d="M1.5 11.5a5 5 0 0 0 10 0" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>'
+    + '<line x1="6.5" y1="16.5" x2="6.5" y2="20.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>'
+    + '<path d="M15 8a7 7 0 0 1 0 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity="1"/>'
+    + '<path d="M19 5a11 11 0 0 1 0 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity="0.5"/>'
+    + '<path d="M23 2.5a15 15 0 0 1 0 19" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity="0.26"/>'
+    + '</svg>';
+  function mkBtn(id, html, title) {
+    var b = document.createElement('button');
+    b.id = id; b.title = title; b.innerHTML = html;
+    b.style.cssText = 'width:36px;height:36px;border-radius:50%;border:2px solid rgba(255,255,255,.35);'
+      + 'background:rgba(38,38,44,.92);color:#c9c9cf;cursor:pointer;padding:0;margin:0;'
+      + 'display:flex;align-items:center;justify-content:center;font:600 16px Rubik,sans-serif;'
+      + 'box-shadow:0 2px 7px rgba(0,0,0,.4);transition:background .12s,color .12s,border-color .12s;';
+    b.addEventListener('mouseenter', function () { b.style.background = 'rgba(62,62,72,.96)'; b.style.color = '#fff'; b.style.borderColor = 'rgba(255,255,255,.6)'; });
+    b.addEventListener('mouseleave', function () { b.style.background = 'rgba(38,38,44,.92)'; b.style.color = '#c9c9cf'; b.style.borderColor = 'rgba(255,255,255,.3)'; });
+    return b;
+  }
+  function ensure() {
+    if (document.getElementById('ggOverlay')) return;
+    var wrap = document.createElement('div');
+    wrap.id = 'ggOverlay';
+    wrap.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;display:flex;gap:8px;';
+    var mic = mkBtn('ggMic', MIC, 'Mic panel');
+    var help = mkBtn('ggHelp', '?', 'Help');
+    mic.addEventListener('click', function () { try { window.chrome.webview.postMessage('gg:toolbar'); } catch (e) {} });
+    help.addEventListener('click', function () { try { window.chrome.webview.postMessage('gg:help'); } catch (e) {} });
+    wrap.appendChild(mic); wrap.appendChild(help);
+    document.documentElement.appendChild(wrap);
+  }
+  ensure();
+  if (!window.__ggOverlayHeal) { window.__ggOverlayHeal = setInterval(ensure, 1500); }
   return 'ok';
 })()
 """;
@@ -623,4 +900,201 @@ internal sealed class MainForm : Form
   return c ? (c.innerText || '').replace(/ /g, ' ').trim() : '';
 })()
 """;
+
+    // Перехват getUserMedia: микрофонный поток ChatGPT прогоняем через компрессор + gain
+    // (вытянуть тихий микрофон, напр. AirPods HFP). Компрессор поднимает тихую речь и режет
+    // пики (без клиппинга при усилении), gain задаёт итоговую громкость.
+    // ВАЖНО: патчим БРАУЗЕРНЫЙ API на navigator — не DOM. Перерисовки React (§6.1) его не
+    // трогают, ставится один раз на document-created и живёт всё время жизни страницы.
+    // Значения — из window.__ggMic: gain меняется на лету (нода __ggMicGain в графе),
+    // enabled/noise вступают в силу при следующем запросе микрофона (перезапрос на старте
+    // диктовки). Плейсхолдеры __EN__/__GAIN__/__NS__ подставляются из сохранённых настроек.
+    private const string MicBoostTemplate = """
+(function () {
+  if (window.__ggMicPatched) return;
+  window.__ggMicPatched = true;
+  window.__ggMic = window.__ggMic || { enabled: __EN__, gain: __GAIN__, noise: __NS__ };
+  // Замер пикового уровня — объективная проверка «идёт ли звук» (а не по глазам на метре).
+  // setInterval, а не requestAnimationFrame: rAF замирает при скрытом окне, а таймеры у нас
+  // не троттлятся (--disable-background-timer-throttling), значит меряется и в трее.
+  window.__ggMicPeak = 0;
+  if (!window.__ggMicMeterRunning) {
+    window.__ggMicMeterRunning = true;
+    setInterval(function () {
+      var an = window.__ggMicAnalyser;
+      if (!an) return;
+      var buf = new Float32Array(an.fftSize);
+      an.getFloatTimeDomainData(buf);
+      var m = 0; for (var i = 0; i < buf.length; i++) { var v = Math.abs(buf[i]); if (v > m) m = v; }
+      if (m > window.__ggMicPeak) window.__ggMicPeak = m;
+    }, 100);
+  }
+  // ДИАГНОСТИКА: пользуется ли диктовка ChatGPT браузерным Web Speech API (webkitSpeechRecognition)?
+  // Если да — он берёт микрофон в ОБХОД getUserMedia, и наш gain до распознавания не доходит в принципе.
+  window.__ggSpeechUsed = false;
+  try {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SR && SR.prototype && !SR.prototype.__ggWrapped) {
+      var origStart = SR.prototype.start;
+      SR.prototype.start = function () { window.__ggSpeechUsed = true; return origStart.apply(this, arguments); };
+      SR.prototype.__ggWrapped = true;
+    }
+  } catch (e) {}
+  var md = navigator.mediaDevices;
+  if (!md || !md.getUserMedia) return;
+  var orig = md.getUserMedia.bind(md);
+  window.__ggMicOrig = orig;       // оригинал наружу — для «разблокировки» списка устройств без нашего графа
+  window.__ggMicCalls = 0;         // сколько раз ChatGPT дёрнул getUserMedia (диагностика)
+  window.__ggMicLast = 'none';     // что перехватчик сделал в последний раз
+  md.getUserMedia = async function (constraints) {
+    window.__ggMicCalls++;
+    constraints = constraints || {};
+    var wantAudio = !!constraints.audio;
+    // ПОЛНЫЙ ОБХОД, когда усиление выключено: ведём себя ровно как обычный браузер —
+    // никакого deviceId/NS/AGC/графа. Тогда «Усиление выкл» = честный baseline «как до внедрения».
+    if (!wantAudio || !window.__ggMic.enabled) {
+      var s0 = await orig(constraints);
+      var t0 = (wantAudio && s0.getAudioTracks) ? s0.getAudioTracks()[0] : null;
+      window.__ggMicTrack = t0
+        ? ((t0.label || '?') + ' | ' + ((t0.getSettings && t0.getSettings().deviceId) || '?'))
+        : (wantAudio ? 'none' : 'video');
+      window.__ggMicLast = wantAudio ? 'bypass-disabled' : 'passthrough-video';
+      return s0;
+    }
+    // === усиление ВКЛЮЧЕНО: применяем нашу обработку (устройство + NS + gain) ===
+    var a = (typeof constraints.audio === 'object') ? Object.assign({}, constraints.audio) : {};
+    a.autoGainControl = false;                        // глушим AGC, чтобы ползунок реально управлял уровнем
+    a.noiseSuppression = !!window.__ggMic.noise;
+    a.echoCancellation = !!window.__ggMic.noise;
+    if (window.__ggMic.deviceId) a.deviceId = { exact: window.__ggMic.deviceId }; // жёстко: выбранный микрофон
+    constraints = Object.assign({}, constraints, { audio: a });
+    window.__ggMicFallback = '';
+    var stream = null;
+    var forced = constraints.audio && typeof constraints.audio === 'object' && constraints.audio.deviceId;
+    if (forced) {
+      // Bluetooth-мик (AirPods) виден Windows только через HFP, который поднимается не сразу.
+      // Поэтому exact пробуем НЕСКОЛЬКО раз с паузой — даём ОС включить HFP, а не откатываемся молча.
+      var lastErr = null;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        try { stream = await orig(constraints); lastErr = null; break; }
+        catch (e) { lastErr = e; stream = null; await new Promise(function (r) { setTimeout(r, 900); }); }
+      }
+      if (!stream) {
+        window.__ggMicFallback = 'exact failed x3: ' + (lastErr && lastErr.message);
+        var c2 = Object.assign({}, constraints.audio); delete c2.deviceId;
+        constraints = Object.assign({}, constraints, { audio: c2 });
+        stream = await orig(constraints);   // откат: без принуждения deviceId
+      }
+    } else {
+      stream = await orig(constraints);
+    }
+    // Какое устройство РЕАЛЬНО захвачено — снимает вопрос «переключилось ли».
+    var at0 = stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+    window.__ggMicTrack = at0
+      ? ((at0.label || '?') + ' | ' + ((at0.getSettings && at0.getSettings().deviceId) || '?'))
+      : 'none';
+    if (!stream.getAudioTracks || !stream.getAudioTracks().length) { window.__ggMicLast = 'passthrough-noaudio'; return stream; }
+    try {
+      if (window.__ggMicCtx) { try { window.__ggMicCtx.close(); } catch (e) {} }
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      var ctx = new Ctx();
+      window.__ggMicCtx = ctx;
+      if (ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} }
+      var src = ctx.createMediaStreamSource(stream);
+      // Сначала УСИЛЕНИЕ (поднимаем весь сигнал), затем лимитер-страховка.
+      var gain = ctx.createGain();
+      gain.gain.value = window.__ggMic.gain;
+      window.__ggMicGain = gain;
+      // Лимитер ПОСЛЕ gain: высокий порог (−3 dB) + большой ratio ловят только пики у 0 dBFS,
+      // не давя полезную речь. Если поставить компрессор ДО gain с низким порогом — он сожмёт
+      // сигнал, а makeup-gain его не компенсирует, и усиления не слышно (была эта грабля).
+      var lim = ctx.createDynamicsCompressor();
+      lim.threshold.value = -3; lim.knee.value = 0; lim.ratio.value = 20;
+      lim.attack.value = 0.002; lim.release.value = 0.1;
+      // Анализатор после лимитера — меряем итоговый пиковый уровень (диагностика «идёт ли звук»).
+      var an = ctx.createAnalyser(); an.fftSize = 512;
+      window.__ggMicAnalyser = an; window.__ggMicPeak = 0;
+      var dest = ctx.createMediaStreamDestination();
+      src.connect(gain); gain.connect(lim); lim.connect(an); an.connect(dest);
+      var out = dest.stream;
+      if (stream.getVideoTracks) stream.getVideoTracks().forEach(function (t) { out.addTrack(t); });
+      window.__ggMicLast = 'boosted gain=' + gain.gain.value + ' ctx=' + ctx.state;
+      return out;
+    } catch (e) { window.__ggMicLast = 'error: ' + (e && e.message); return stream; }
+  };
+})()
+""";
+
+    // Диагностика перехвата: сработал ли патч, сколько раз ChatGPT звал getUserMedia,
+    // что перехватчик сделал в последний раз, состояние gain-ноды и аудиоконтекста.
+    private const string MicDiagScript = """
+(function () {
+  return JSON.stringify({
+    patched: !!window.__ggMicPatched,
+    calls: window.__ggMicCalls || 0,
+    last: window.__ggMicLast || 'none',
+    gain: window.__ggMicGain ? window.__ggMicGain.gain.value : null,
+    ctx: window.__ggMicCtx ? window.__ggMicCtx.state : null,
+    peak: window.__ggMicPeak != null ? Math.round(window.__ggMicPeak * 1000) / 1000 : null,
+    track: window.__ggMicTrack || null,
+    fb: window.__ggMicFallback || '',
+    speech: !!window.__ggSpeechUsed
+  });
+})()
+""";
+
+    // Перечисление микрофонов АСИНХРОННО, а ExecuteScriptAsync НЕ дожидается Promise
+    // (сериализует само обещание) — поэтому запуск и чтение разнесены: этот скрипт стартует
+    // перечисление и кладёт результат в window.__ggMicList, а C# опрашивает MicListReadScript.
+    // Метки/ID устройств закрыты, пока странице не выдан доступ к микрофону — разово
+    // разблокируем через ОРИГИНАЛЬНЫЙ getUserMedia (не наш патч) и сразу отпускаем устройство.
+    private const string EnumMicsKickScript = """
+(function () {
+  window.__ggMicListReady = false;
+  window.__ggMicList = null;
+  window.__ggMicListErr = '';
+  (async function () {
+    try {
+      var devs = await navigator.mediaDevices.enumerateDevices();
+      var mics = devs.filter(function (d) { return d.kind === 'audioinput'; });
+      var haveLabels = mics.some(function (d) { return d.deviceId && d.label; });
+      if (!haveLabels && window.__ggMicOrig) {
+        try {
+          var s = await window.__ggMicOrig({ audio: true });
+          s.getTracks().forEach(function (t) { t.stop(); });
+          devs = await navigator.mediaDevices.enumerateDevices();
+          mics = devs.filter(function (d) { return d.kind === 'audioinput'; });
+        } catch (e) { window.__ggMicListErr = 'prime: ' + (e && e.message); }
+      }
+      // Только РЕАЛЬНЫЕ устройства: роли-псевдонимы Windows (default/communications) убираем —
+      // они нестабильны (соскальзывают на другое устройство) и путают («Kommunikation - AirPods»).
+      window.__ggMicList = mics
+        .filter(function (d) { return d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications'; })
+        .map(function (d) { return { id: d.deviceId, label: d.label || d.deviceId }; });
+    } catch (e) {
+      window.__ggMicList = [];
+      window.__ggMicListErr = 'enum: ' + (e && e.message);
+    }
+    window.__ggMicListReady = true;
+  })();
+  return 'started';
+})()
+""";
+
+    // Чтение результата перечисления (пусто, пока не готово).
+    private const string MicListReadScript = """
+(function () {
+  if (!window.__ggMicListReady) return '';
+  return JSON.stringify({
+    sel: window.__ggMic ? (window.__ggMic.deviceId || '') : '',
+    mics: window.__ggMicList || [],
+    error: window.__ggMicListErr || ''
+  });
+})()
+""";
+
+    private static string MicBoostScript(MicSettings m) => MicBoostTemplate
+        .Replace("__EN__", m.Enabled ? "true" : "false")
+        .Replace("__GAIN__", m.Gain.ToString(CultureInfo.InvariantCulture))
+        .Replace("__NS__", m.Noise ? "true" : "false");
 }
