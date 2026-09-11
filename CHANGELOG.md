@@ -3,6 +3,37 @@
 A short chronology of the work. WS protocol details — in [docs/PROTOCOL.md](docs/PROTOCOL.md);
 architecture, decisions and pitfalls — in [CLAUDE.md](CLAUDE.md).
 
+## 2026-09-11 — ChatGPT composer rebuilt: resilient button lookup and session diagnosis
+
+ChatGPT rolled out a "unified composer": the form gained `data-type="unified-composer"`, a new
+pill button ("Nachdenken" / thinking) appeared next to dictation, and the voice-mode button lost
+its `data-testid` — only a localized label is left (e.g. "Sprachchat starten"). The dictation
+buttons survived, but now hang on `aria-label` alone, which follows the UI language.
+
+- **Lookup anchored to the composer form.** Both versions first find the composer
+  (`form[data-type="unified-composer"]` → a form whose class contains `composer`) and search
+  inside it instead of scanning every `button` on the page.
+- **Language-independent fallback.** If labels get renamed or translated differently, the button
+  is taken by position: "a form button with no id, no data-testid and no text of its own" (plus
+  and submit drop out by id, the "Nachdenken" pill by its text). At rest that is
+  [dictation, voice chat]; while recording, [cancel, submit dictation]. Verified live in both states.
+- **Stale dictation UI is cleared.** If the page stayed in recording mode (app restarted, window
+  closed), there is no "Start" button on it and every new start was doomed. Such UI is now closed
+  first (a Cancel click), and recording starts over.
+- **A diagnosis instead of a blank refusal.** The dictation button is also missing when the page
+  is fine but the session went stale: service requests (`backend-api/me`, `settings/user`,
+  `sentinel`) are rejected with 503 and the composer is silently drawn without a microphone —
+  waiting does not help, signing in again does. On a failed start the app probes
+  `backend-api/me`: 200 → "ChatGPT not ready", otherwise → "Session expired — sign in again",
+  plus a hint in the log.
+- **Firefox version.** Dictation buttons were looked up by English labels only — on a German or
+  Russian interface they were not found at all. Labels now cover three languages, and the "empty"
+  detector is fixed (it relied on the vanished `composer-speech-button`).
+- **Flag `--devtools-port N`** (WebView2 version) — opens the Chromium debugging port on
+  `127.0.0.1:N`: inspect the embedded page, capture a DOM snapshot when ChatGPT reshuffles its
+  markup again. Off by default; while the port is open, any program on this computer can reach
+  your ChatGPT session.
+
 ## 2026-06-29 — Standalone WebView2 version (GPT Grabber) + installer
 
 A second, self-contained version lives in `poc-webview2/` — it embeds ChatGPT via

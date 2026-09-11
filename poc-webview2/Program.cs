@@ -1,4 +1,4 @@
-using System.Windows.Forms;
+﻿using System.Windows.Forms;
 
 namespace WebView2Poc;
 
@@ -108,7 +108,7 @@ internal static class Program
     }
 
     /// <summary>Значение опции вида «--name значение» из аргументов запуска (или null).</summary>
-    private static string? GetOption(string name)
+    internal static string? GetOption(string name)
     {
         var args = Environment.GetCommandLineArgs();
         for (int i = 1; i < args.Length - 1; i++)

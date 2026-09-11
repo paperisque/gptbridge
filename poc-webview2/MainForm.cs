@@ -1,4 +1,4 @@
-using System.Drawing;
+﻿using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
@@ -98,12 +98,16 @@ internal sealed class MainForm : Form
         root.RowStyles.Add(_logRow);
 
         _web.Dock = DockStyle.Fill;
+        // Отладочный порт Chromium (--devtools-port N) — для внешнего анализа DOM по CDP.
+        // Без флага строка аргументов ровно прежняя, поведение не меняется.
+        var dbgPort = Program.GetOption("--devtools-port");
         _web.CreationProperties = new CoreWebView2CreationProperties
         {
             UserDataFolder = Diag.WebViewDataDir,
             // Не давать Chromium «засыпать» в фоне/свёрнутым — захват микрофона должен идти.
             AdditionalBrowserArguments =
                 "--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
+                + (string.IsNullOrEmpty(dbgPort) ? "" : $" --remote-debugging-port={dbgPort}")
         };
 
         _log.Multiline = true;
@@ -349,11 +353,25 @@ internal sealed class MainForm : Form
         OverlayShow(StatusOverlay.Phase.Preparing, Win32.GetForegroundWindow());
         try
         {
+            // Страница могла остаться в режиме записи от прошлого раза (окно закрыли, программу
+            // перезапустили). Кнопки «Start» в этом состоянии на странице нет вообще, и любой
+            // новый старт обречён — поэтому сперва закрываем зависший UI диктовки.
+            if ((await Exec(DictationStateScript)).Contains("\"live\":true"))
+            {
+                Diag.Write("висит UI диктовки — отбой: " + await Exec(CancelScript));
+                await Task.Delay(400, ct);
+            }
+
             // Ждём появления кнопки Start (не фиксированную паузу).
             if (!await PollAsync(StartReadyScript, "ready", 20, 300, ct))
             {
-                Diag.Write("кнопка Start не появилась");
-                OverlaySet(StatusOverlay.Phase.Error, Lang.T("err.not_ready"));
+                // Два разных отказа под одной надписью — разводим их пробой служебного API:
+                // 200 → страница просто не догрузилась; иначе → сессия протухла, нужен перелогин.
+                string api = await ProbeBackendAsync();
+                bool sessionBad = api != "200";
+                Diag.Write($"кнопка Start не появилась (backend-api/me → {api})");
+                OverlaySet(StatusOverlay.Phase.Error, Lang.T(sessionBad ? "err.session" : "err.not_ready"));
+                if (sessionBad) Log(Lang.T("log.session_hint", api));
                 State = LiveState.Idle;
                 return;
             }
@@ -767,20 +785,59 @@ internal sealed class MainForm : Form
             + Lang.T("help.flags_title") + nl
             + "•  " + Lang.T("help.flag_lang") + nl
             + "•  " + Lang.T("help.flag_tray") + nl
-            + "•  " + Lang.T("help.flag_nobeep");
+            + "•  " + Lang.T("help.flag_nobeep") + nl
+            + "•  " + Lang.T("help.flag_devtools");
     }
 
     // --------------------------- JS-скрипты ---------------------------
     // Селекторы кнопок ChatGPT локализованы — матчим EN/DE/RU (см. историю POC).
 
+    // Общий пролог для скриптов-операций: якорь на композер и поиск кнопок.
+    // Зачем: у кнопок диктовки НЕТ ни id, ни data-testid — только локализованный aria-label
+    // (проверено 11.09.2026: «Diktat starten/absenden/abbrechen»). Поэтому ищем в два захода —
+    // по aria-label на всех языках, а если разметку переименуют/переведут иначе, по позиции
+    // среди безымянных кнопок-иконок формы. Якорь формы: новый атрибут data-type="unified-composer"
+    // (устойчивее класса), затем прежний класс с «composer», затем весь документ.
+    private const string JsPrelude = """
+var GG = (function () {
+  function form() {
+    return document.querySelector('form[data-type="unified-composer"]')
+      || [...document.querySelectorAll('form')].find(function (f) { return (f.className || '').includes('composer'); })
+      || null;
+  }
+  function root() { return form() || document; }
+  function buttons() { return [...root().querySelectorAll('button')]; }
+  function byAria(re) {
+    return buttons().find(function (b) { return re.test(b.getAttribute('aria-label') || ''); }) || null;
+  }
+  // Кнопки-иконки трейлинг-группы: всё, что не опознано по id/testid и не имеет своего
+  // текста (плюс и отправка отсеиваются по id, pill «Nachdenken» — по тексту). Признак не
+  // зависит от языка, поэтому годится фолбэком, когда aria-label переименуют или переведут.
+  // В покое остаются [диктовка, голосовой чат], во время записи — [отмена, отправка диктовки].
+  function icons() {
+    return buttons().filter(function (b) {
+      return !b.id && !b.getAttribute('data-testid') && !(b.innerText || '').trim();
+    });
+  }
+  function recording() {
+    return !!byAria(/submit dictation|cancel dictation|diktat absenden|diktat senden|diktat abbrechen|диктов/i)
+      || !document.querySelector('#prompt-textarea');
+  }
+  return { form: form, root: root, buttons: buttons, byAria: byAria, icons: icons, recording: recording };
+})();
+""";
+
+    /// <summary>Скрипт-операция с прологом (GG.*).</summary>
+    private static string Js(string body) => JsPrelude + Environment.NewLine + body;
+
     // Готова ли кнопка начала диктовки.
-    private const string StartReadyScript = """
+    private static readonly string StartReadyScript = Js("""
 (function () {
-  var b = [...document.querySelectorAll('button')].find(x =>
-    /start dictation|diktat starten|начать диктов/i.test(x.getAttribute('aria-label') || ''));
+  var b = GG.byAria(/start dictation|diktat starten|начать диктов/i);
+  if (!b && !GG.recording() && GG.icons().length >= 2) b = GG.icons()[0];   // позиционный фолбэк
   return b ? 'ready' : 'no';
 })()
-""";
+""");
 
     // Прячем через CSS (правило живёт в <head>, переживает перерисовки React, узел не удаляем):
     //  (1) блок СРАЗУ ЗА #thread-bottom — лишние кнопки, что прыгают при сужении окна;
@@ -852,46 +909,78 @@ internal sealed class MainForm : Form
 })()
 """;
 
-    // Найти и нажать кнопку начала диктовки (EN/DE/RU).
-    private const string ClickStartScript = """
+    // Найти и нажать кнопку начала диктовки (EN/DE/RU, с позиционным фолбэком).
+    private static readonly string ClickStartScript = Js("""
 (function () {
-  var b = [...document.querySelectorAll('button')].find(x =>
-    /start dictation|diktat starten|начать диктов|диктовку начать/i.test(x.getAttribute('aria-label') || ''));
+  var b = GG.byAria(/start dictation|diktat starten|начать диктов|диктовку начать/i);
+  var how = 'aria';
+  if (!b && !GG.recording() && GG.icons().length >= 2) { b = GG.icons()[0]; how = 'по позиции'; }
   if (!b) return 'Start НЕ найдена';
   b.click();
-  return 'клик Start (aria="' + (b.getAttribute('aria-label') || '') + '")';
+  return 'клик Start (' + how + ', aria="' + (b.getAttribute('aria-label') || '') + '")';
 })()
-""";
+""");
 
     // Идёт ли запись (есть кнопка Submit/Cancel dictation или исчез композер).
-    private const string DictationStateScript = """
+    private static readonly string DictationStateScript = Js("""
 (function () {
-  var btns = [...document.querySelectorAll('button')];
-  var live = btns.some(x => /submit dictation|diktat absenden|diktat senden|cancel dictation|diktat abbrechen|диктов/i
-    .test(x.getAttribute('aria-label') || ''));
+  var live = !!GG.byAria(/submit dictation|diktat absenden|diktat senden|cancel dictation|diktat abbrechen|диктов/i);
   return JSON.stringify({ live: live, composerGone: !document.querySelector('#prompt-textarea') });
 })()
-""";
+""");
 
-    // Отправить диктовку на распознавание (EN/DE/RU).
-    private const string SubmitScript = """
+    // Отправить диктовку на распознавание (EN/DE/RU, с позиционным фолбэком).
+    private static readonly string SubmitScript = Js("""
 (function () {
-  var b = [...document.querySelectorAll('button')].find(x =>
-    /submit dictation|diktat absenden|diktat senden|отправить диктов/i.test(x.getAttribute('aria-label') || ''));
-  if (b) { b.click(); return 'клик Submit (aria="' + (b.getAttribute('aria-label') || '') + '")'; }
-  return 'Submit НЕ найдена';
+  var b = GG.byAria(/submit dictation|diktat absenden|diktat senden|отправить диктов/i);
+  var how = 'aria';
+  if (!b && GG.icons().length >= 2) { b = GG.icons()[1]; how = 'по позиции'; }   // [отмена, отправка]
+  if (!b) return 'Submit НЕ найдена';
+  b.click();
+  return 'клик Submit (' + how + ', aria="' + (b.getAttribute('aria-label') || '') + '")';
+})()
+""");
+
+    // Отмена диктовки (EN/DE/RU, с позиционным фолбэком) — закрыть UI записи без отправки.
+    private static readonly string CancelScript = Js("""
+(function () {
+  var b = GG.byAria(/cancel dictation|diktat abbrechen|отменить диктов/i);
+  var how = 'aria';
+  if (!b && GG.icons().length >= 2) { b = GG.icons()[0]; how = 'по позиции'; }   // [отмена, отправка]
+  if (!b) return 'Cancel не найдена';
+  b.click();
+  return 'клик Cancel (' + how + ')';
+})()
+""");
+
+    // Проба служебного API ChatGPT. Зачем: кнопки диктовки не будет и тогда, когда страница
+    // цела, но сессия протухла — служебные запросы (me, settings/user, sentinel) отбиваются 503,
+    // и композер молча рисуется без микрофона; лечится перелогином, ждать бесполезно.
+    // Два шага, потому что ExecuteScriptAsync не ждёт промис: сперва пуск, потом чтение.
+    private const string BackendProbeStartScript = """
+(function () {
+  window.__ggApiProbe = 'wait';
+  fetch('/backend-api/me', { headers: { accept: 'application/json' } })
+    .then(function (r) { window.__ggApiProbe = String(r.status); })
+    .catch(function () { window.__ggApiProbe = 'err'; });
+  return 'started';
 })()
 """;
 
-    // Отмена диктовки (EN/DE/RU) — закрыть UI записи без отправки.
-    private const string CancelScript = """
-(function () {
-  var b = [...document.querySelectorAll('button')].find(x =>
-    /cancel dictation|diktat abbrechen|отменить диктов/i.test(x.getAttribute('aria-label') || ''));
-  if (b) { b.click(); return 'клик Cancel'; }
-  return 'Cancel не найдена';
-})()
-""";
+    private const string BackendProbeReadScript = "window.__ggApiProbe || 'wait'";
+
+    /// <summary>Код ответа служебного API («200», «503», «err», «wait» — если не дождались).</summary>
+    private async Task<string> ProbeBackendAsync()
+    {
+        await Exec(BackendProbeStartScript);
+        for (int i = 0; i < 10; i++)
+        {
+            await Task.Delay(300);
+            var v = (await Exec(BackendProbeReadScript)).Trim('"');
+            if (v != "wait") return v;
+        }
+        return "wait";
+    }
 
     // Прочитать распознанный текст из композера.
     private const string ComposerReadScript = """

@@ -49,7 +49,8 @@ Flags go **after** the DLL path — `dotnet "…\WebView2Poc.dll" <flags>`:
 
 - `--lang en|de|ru` — UI language (overrides the system language; default is the Windows UI language);
 - `--tray` — start minimized to the tray;
-- `--no-beep` — turn off the confirmation sound on paste.
+- `--no-beep` — turn off the confirmation sound on paste;
+- `--devtools-port N` — open the Chromium debugging port on `127.0.0.1:N` for diagnostics (inspect the embedded page, capture a DOM snapshot when ChatGPT changes its markup). **Off by default, and keep it that way unless you are debugging:** while the port is open, any program running on this computer can drive the page and reach your ChatGPT session.
 
 ## Good to know
 

@@ -1,4 +1,4 @@
-namespace WebView2Poc;
+﻿namespace WebView2Poc;
 
 /// <summary>
 /// Локализация видимых надписей: язык берём из системы (как в сервере — через LANGID,
@@ -45,6 +45,8 @@ internal static class Lang
         ["overlay.done"] = "Inserted",
         ["overlay.error"] = "Error",
         ["err.not_ready"] = "ChatGPT not ready",
+        ["err.session"] = "Session expired — sign in again",
+        ["log.session_hint"] = "ChatGPT rejects service requests (backend-api/me → {0}). Sign out and sign in again in the window above.",
         ["err.no_recording"] = "Recording didn't start",
         ["err.cancelled"] = "Cancelled",
         ["err.start_failed"] = "Start error",
@@ -76,6 +78,7 @@ internal static class Lang
         ["help.flag_lang"] = "--lang en|de|ru — interface language (overrides the system one)",
         ["help.flag_tray"] = "--tray — start minimized to the tray",
         ["help.flag_nobeep"] = "--no-beep — turn off the sound on paste",
+        ["help.flag_devtools"] = "--devtools-port N — open the Chromium debugging port for diagnostics (WARNING: while it is on, any program on this computer can reach your ChatGPT session)",
     };
 
     private static readonly Dictionary<string, string> De = new()
@@ -89,6 +92,8 @@ internal static class Lang
         ["overlay.done"] = "Eingefügt",
         ["overlay.error"] = "Fehler",
         ["err.not_ready"] = "ChatGPT nicht bereit",
+        ["err.session"] = "Sitzung abgelaufen — neu anmelden",
+        ["log.session_hint"] = "ChatGPT lehnt Dienstanfragen ab (backend-api/me → {0}). Oben abmelden und neu anmelden.",
         ["err.no_recording"] = "Aufnahme nicht gestartet",
         ["err.cancelled"] = "Abgebrochen",
         ["err.start_failed"] = "Startfehler",
@@ -120,6 +125,7 @@ internal static class Lang
         ["help.flag_lang"] = "--lang en|de|ru — Sprache der Oberfläche (überschreibt die Systemsprache)",
         ["help.flag_tray"] = "--tray — minimiert in den Infobereich starten",
         ["help.flag_nobeep"] = "--no-beep — Ton beim Einfügen ausschalten",
+        ["help.flag_devtools"] = "--devtools-port N — Chromium-Debug-Port für die Diagnose öffnen (ACHTUNG: solange aktiv, kann jedes Programm auf diesem Rechner auf Ihre ChatGPT-Sitzung zugreifen)",
     };
 
     private static readonly Dictionary<string, string> Ru = new()
@@ -133,6 +139,8 @@ internal static class Lang
         ["overlay.done"] = "Вставлено",
         ["overlay.error"] = "Ошибка",
         ["err.not_ready"] = "ChatGPT не готов",
+        ["err.session"] = "Сессия протухла — перелогинься",
+        ["log.session_hint"] = "ChatGPT отбивает служебные запросы (backend-api/me → {0}). Выйди из аккаунта в окне выше и войди заново.",
         ["err.no_recording"] = "Запись не пошла",
         ["err.cancelled"] = "Отменено",
         ["err.start_failed"] = "Ошибка старта",
@@ -164,5 +172,6 @@ internal static class Lang
         ["help.flag_lang"] = "--lang en|de|ru — язык интерфейса (перекрывает системный)",
         ["help.flag_tray"] = "--tray — запуститься свёрнутым в трей",
         ["help.flag_nobeep"] = "--no-beep — выключить звук при вставке",
+        ["help.flag_devtools"] = "--devtools-port N — открыть отладочный порт Chromium для диагностики (ВНИМАНИЕ: пока включён, любая программа на этом компьютере имеет доступ к вашей сессии ChatGPT)",
     };
 }
