@@ -552,7 +552,7 @@ internal sealed class MainForm : Form
         _tips.SetToolTip(master, Lang.T("toolbar.enable_tip"));
 
         // 2. Селектор микрофона (без заголовка).
-        _micCombo = new SmallComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180, Anchor = mid, Margin = gap };
+        _micCombo = new SmallComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 260, Anchor = mid, Margin = gap };
         _micCombo.Items.Add(new MicDevice("", Lang.T("toolbar.device_default")));
         _micCombo.SelectedIndex = 0;
         _micCombo.SelectedIndexChanged += (_, _) =>
@@ -579,7 +579,7 @@ internal sealed class MainForm : Form
         const int SliderX = 18;          // ползунок правее иконки — дорожка стартует сразу за ней (иконка «вплотную»)
         const double ValueFrac = 0.70;   // позиция значения = доля ширины ползунка (у конца дорожки) — ТЮНИНГ
         var volIcon = new MicGainIcon();
-        _gainBar = new MaterialSlider
+        _gainBar = new SmallThumbSlider
         {
             RangeMin = 10,
             RangeMax = 80,
@@ -595,7 +595,7 @@ internal sealed class MainForm : Form
         _gainValue = new Label
         {
             Text = GainText(_mic.Gain),
-            Font = new Font(Palette.FontName, 9f),   // значение в ~1.5× мельче контролов
+            Font = new Font(Palette.Family, 9f),   // значение в ~1.5× мельче контролов
             ForeColor = Palette.Text,
             BackColor = Palette.Bg,
             AutoSize = true,
@@ -659,7 +659,7 @@ internal sealed class MainForm : Form
         mgr.ColorScheme = new ColorScheme(
             Primary.BlueGrey800, Primary.BlueGrey900, Primary.BlueGrey700,
             Accent.LightBlue200, TextShade.WHITE);
-        MaterialFonts.Apply(Palette.FontName, 13);
+        MaterialFonts.Apply(Palette.Family, 13);
     }
 
     /// <summary>Показать/скрыть тулбар — плавно по высоте (0 ↔ ToolbarPx).</summary>

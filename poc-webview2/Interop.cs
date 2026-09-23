@@ -66,6 +66,10 @@ internal static partial class Win32
         return sb.ToString();
     }
 
+    // Приватный шрифт для GDI (только этот процесс, без установки в систему) — см. UiFonts.
+    public const uint FR_PRIVATE = 0x10;
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] public static extern int AddFontResourceEx(string name, uint fl, IntPtr res);
+
     [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool UnhookWindowsHookEx(IntPtr hhk);
     [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);

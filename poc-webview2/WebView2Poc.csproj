@@ -24,11 +24,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Приватные шрифты индикатора (StatusOverlay.PickFont) — те же файлы, что в сервере;
-         без них пилюля откатывалась на системный Roboto. В гит не коммитим (.gitignore):
-         Google Sans проприетарный. Своя копия — сервер при этом не трогаем. -->
+    <!-- Приватные шрифты без установки в систему: Rubik — тулбар (UiFonts), Manrope — подпись пилюли
+         (Overlay.PickFont). Только свободные (OFL), каждый — исключением в .gitignore; едут в установщик.
+         Проприетарный Google Sans сюда не класть (он остался только у сервера Firefox-версии). -->
     <None Update="fonts\*.ttf" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fonts\*.otf" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fonts\*.txt" CopyToOutputDirectory="PreserveNewest" /> <!-- лицензии шрифтов (OFL требует класть рядом) -->
   </ItemGroup>
 
 </Project>

@@ -113,7 +113,8 @@ internal static class StatusOverlay
     private static readonly uint ColBusy = Rgb(80, 155, 255);
     private static readonly uint ColErr = Rgb(235, 80, 80);
 
-    private static readonly string[] TextFontChain = { "Google Sans", "Poppins", "Roboto", "Segoe UI" };
+    // Manrope (OFL, едет в fonts/) — проприетарный Google Sans в установщик не кладём; Poppins выбыл: без кириллицы.
+    private static readonly string[] TextFontChain = { "Manrope", "Segoe UI" };
     private static readonly PrivateFontCollection PrivateFonts = LoadPrivateFonts();
     private static readonly Font TextFont = PickFont(TextFontChain, 9.75f, FontStyle.Bold);
     private static readonly Font IconFont = new("Segoe MDL2 Assets", 11f, FontStyle.Regular, GraphicsUnit.Point);

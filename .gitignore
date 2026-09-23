@@ -33,6 +33,10 @@ server-csharp/VoiceBridge/fonts/*.ttf
 server-csharp/VoiceBridge/fonts/*.otf
 poc-webview2/fonts/*.ttf
 poc-webview2/fonts/*.otf
+# Rubik — шрифт тулбара, свободный (SIL OFL, лицензия рядом): без него программа теряла шрифт на старте
+!poc-webview2/fonts/Rubik-Regular.ttf
+# Manrope — шрифт подписи пилюли, свободный (SIL OFL, лицензия рядом)
+!poc-webview2/fonts/Manrope-Bold.ttf
 
 # ---- Не для публичного репозитория ----
 # Демо-ролики (тяжёлые; решим позже, чем делиться) и внутренняя «память» ассистента.
