@@ -800,30 +800,47 @@ internal sealed class MainForm : Form
     // (устойчивее класса), затем прежний класс с «composer», затем весь документ.
     private const string JsPrelude = """
 var GG = (function () {
+  // Якорь формы: с 10.10.2026 — form[data-chatgpt-composer]; прежние (data-type, класс composer) — на всякий случай.
   function form() {
-    return document.querySelector('form[data-type="unified-composer"]')
+    return document.querySelector('form[data-chatgpt-composer]')
+      || document.querySelector('form[data-type="unified-composer"]')
       || [...document.querySelectorAll('form')].find(function (f) { return (f.className || '').includes('composer'); })
       || null;
   }
   function root() { return form() || document; }
+  // Композер: с 10.10.2026 у ProseMirror нет id (#prompt-textarea исчез), есть data-composer-markdown.
+  function composer() {
+    return root().querySelector('[data-composer-markdown]')
+      || root().querySelector('.ProseMirror[contenteditable="true"]')
+      || document.querySelector('#prompt-textarea')
+      || null;
+  }
   function buttons() { return [...root().querySelectorAll('button')]; }
   function byAria(re) {
     return buttons().find(function (b) { return re.test(b.getAttribute('aria-label') || ''); }) || null;
   }
-  // Кнопки-иконки трейлинг-группы: всё, что не опознано по id/testid и не имеет своего
-  // текста (плюс и отправка отсеиваются по id, pill «Nachdenken» — по тексту). Признак не
-  // зависит от языка, поэтому годится фолбэком, когда aria-label переименуют или переведут.
-  // В покое остаются [диктовка, голосовой чат], во время записи — [отмена, отправка диктовки].
+  // Подписи (сняты 10.10.2026, EN/DE/RU). Покой: Dictate / Diktieren / Диктовать. Запись: Cancel dictation /
+  // Diktat abbrechen / Отменить диктовку; Stop dictation / Diktat beenden / Остановить диктовку; третья —
+  // «Transcribe and send / Transkribieren und übermitteln / Расшифровать и отправить» (отправка боту, НЕ кликать).
+  // Образцы с начала строки: /диктов/ ловил бы и «Диктовать» в покое. Старые подписи (до 10.10) оставлены.
+  var START = /^(dictate|start dictation|diktieren|diktat starten|диктовать|начать диктов)/i;
+  var STOP = /^(stop dictation|finish dictation|submit dictation|diktat beenden|diktat absenden|diktat senden|остановить диктов|отправить диктов)/i;
+  var CANCEL = /^(cancel dictation|diktat abbrechen|отменить диктов)/i;
+  // Кнопки-иконки формы: без id/testid и без своего текста (pill «Nachdenken/Think» отсеивается по тексту).
+  // Признак не зависит от языка — фолбэк на случай новых подписей. С 10.10.2026 у «+» тоже нет id, поэтому
+  // в покое это [+, диктовка, голосовой чат], в записи [отмена, стоп, расшифровать-и-отправить]:
+  // нужная кнопка — ВТОРАЯ С КОНЦА в обоих состояниях, отмена — первая.
   function icons() {
     return buttons().filter(function (b) {
       return !b.id && !b.getAttribute('data-testid') && !(b.innerText || '').trim();
     });
   }
-  function recording() {
-    return !!byAria(/submit dictation|cancel dictation|diktat absenden|diktat senden|diktat abbrechen|диктов/i)
-      || !document.querySelector('#prompt-textarea');
-  }
-  return { form: form, root: root, buttons: buttons, byAria: byAria, icons: icons, recording: recording };
+  function second() { var a = icons(); return a.length >= 2 ? a[a.length - 2] : null; }
+  // Идёт ли запись — только по кнопкам. Раньше считалось и по пропавшему #prompt-textarea: 10.10 id исчез
+  // навсегда, и «запись идёт» стало вечным, что отключило позиционный фолбэк.
+  function recording() { return !!(byAria(STOP) || byAria(CANCEL)); }
+  return { form: form, root: root, composer: composer, buttons: buttons, byAria: byAria, icons: icons, second: second,
+           recording: recording, START: START, STOP: STOP, CANCEL: CANCEL };
 })();
 """;
 
@@ -833,22 +850,25 @@ var GG = (function () {
     // Готова ли кнопка начала диктовки.
     private static readonly string StartReadyScript = Js("""
 (function () {
-  var b = GG.byAria(/start dictation|diktat starten|начать диктов/i);
-  if (!b && !GG.recording() && GG.icons().length >= 2) b = GG.icons()[0];   // позиционный фолбэк
+  var b = GG.byAria(GG.START);
+  if (!b && !GG.recording()) b = GG.second();   // позиционный фолбэк
   return b ? 'ready' : 'no';
 })()
 """);
 
     // Прячем через CSS (правило живёт в <head>, переживает перерисовки React, узел не удаляем):
-    //  (1) блок СРАЗУ ЗА #thread-bottom — лишние кнопки, что прыгают при сужении окна;
-    //  (2) элемент ПЕРЕД #thread-bottom-container (контейнер композера) — заголовок, он мешает.
-    // *:has(+ X) = предыдущий сосед X. Идемпотентно.
+    //  (1) блок подсказок под композером («Создать изображение…»): с 10.10.2026 — section с классом
+    //      group/home-suggestions; раньше — сосед сразу за #thread-bottom;
+    //  (2) заголовок над композером («Можем начинать.»): с 10.10.2026 — контейнер h1.heading-xl
+    //      (там два h1: невидимый для размера и видимый, оба в одном div); раньше — сосед перед
+    //      #thread-bottom-container. Старые правила оставлены, они безвредны. Идемпотентно.
     private const string HideExtrasScript = """
 (function () {
   var id = 'gptgrabber-hide-extras';
   var s = document.getElementById(id);
   if (!s) { s = document.createElement('style'); s.id = id; (document.head || document.documentElement).appendChild(s); }
-  s.textContent = '#thread-bottom + div, *:has(+ #thread-bottom-container) { display: none !important; }';
+  s.textContent = '#thread-bottom + div, *:has(+ #thread-bottom-container), '
+    + 'main section[class*="home-suggestions"], main div:has(> h1.heading-xl) { display: none !important; }';
   return 'ok';
 })()
 """;
@@ -896,9 +916,9 @@ var GG = (function () {
 """;
 
     // Очистка композера (фокус + выделить всё + execCommand delete) — работает и в фоне.
-    private const string ClearComposerScript = """
+    private static readonly string ClearComposerScript = Js("""
 (function () {
-  var el = document.querySelector('#prompt-textarea');
+  var el = GG.composer();
   if (!el) return 'no composer';
   el.focus();
   var sel = window.getSelection();
@@ -907,14 +927,14 @@ var GG = (function () {
   if (!ok) ok = document.execCommand('insertText', false, '');
   return 'clear ok=' + ok;
 })()
-""";
+""");
 
     // Найти и нажать кнопку начала диктовки (EN/DE/RU, с позиционным фолбэком).
     private static readonly string ClickStartScript = Js("""
 (function () {
-  var b = GG.byAria(/start dictation|diktat starten|начать диктов|диктовку начать/i);
+  var b = GG.byAria(GG.START);
   var how = 'aria';
-  if (!b && !GG.recording() && GG.icons().length >= 2) { b = GG.icons()[0]; how = 'по позиции'; }
+  if (!b && !GG.recording()) { b = GG.second(); how = 'по позиции'; }
   if (!b) return 'Start НЕ найдена';
   b.click();
   return 'клик Start (' + how + ', aria="' + (b.getAttribute('aria-label') || '') + '")';
@@ -924,17 +944,16 @@ var GG = (function () {
     // Идёт ли запись (есть кнопка Submit/Cancel dictation или исчез композер).
     private static readonly string DictationStateScript = Js("""
 (function () {
-  var live = !!GG.byAria(/submit dictation|diktat absenden|diktat senden|cancel dictation|diktat abbrechen|диктов/i);
-  return JSON.stringify({ live: live, composerGone: !document.querySelector('#prompt-textarea') });
+  return JSON.stringify({ live: GG.recording(), composerGone: !GG.composer() });
 })()
 """);
 
     // Отправить диктовку на распознавание (EN/DE/RU, с позиционным фолбэком).
     private static readonly string SubmitScript = Js("""
 (function () {
-  var b = GG.byAria(/submit dictation|diktat absenden|diktat senden|отправить диктов/i);
+  var b = GG.byAria(GG.STOP);
   var how = 'aria';
-  if (!b && GG.icons().length >= 2) { b = GG.icons()[1]; how = 'по позиции'; }   // [отмена, отправка]
+  if (!b) { b = GG.second(); how = 'по позиции'; }   // [отмена, стоп, расшифровать-и-отправить]
   if (!b) return 'Submit НЕ найдена';
   b.click();
   return 'клик Submit (' + how + ', aria="' + (b.getAttribute('aria-label') || '') + '")';
@@ -944,9 +963,9 @@ var GG = (function () {
     // Отмена диктовки (EN/DE/RU, с позиционным фолбэком) — закрыть UI записи без отправки.
     private static readonly string CancelScript = Js("""
 (function () {
-  var b = GG.byAria(/cancel dictation|diktat abbrechen|отменить диктов/i);
+  var b = GG.byAria(GG.CANCEL);
   var how = 'aria';
-  if (!b && GG.icons().length >= 2) { b = GG.icons()[0]; how = 'по позиции'; }   // [отмена, отправка]
+  if (!b && GG.recording() && GG.icons().length >= 2) { b = GG.icons()[0]; how = 'по позиции'; }   // [отмена, стоп, …]
   if (!b) return 'Cancel не найдена';
   b.click();
   return 'клик Cancel (' + how + ')';
@@ -983,12 +1002,12 @@ var GG = (function () {
     }
 
     // Прочитать распознанный текст из композера.
-    private const string ComposerReadScript = """
+    private static readonly string ComposerReadScript = Js("""
 (function () {
-  var c = document.querySelector('#prompt-textarea');
+  var c = GG.composer();
   return c ? (c.innerText || '').replace(/ /g, ' ').trim() : '';
 })()
-""";
+""");
 
     // Перехват getUserMedia: микрофонный поток ChatGPT прогоняем через компрессор + gain
     // (вытянуть тихий микрофон, напр. AirPods HFP). Компрессор поднимает тихую речь и режет

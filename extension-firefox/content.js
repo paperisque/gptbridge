@@ -1,4 +1,4 @@
-// Content script: читает композер ChatGPT (ProseMirror, #prompt-textarea) и
+// Content script: читает композер ChatGPT (ProseMirror, см. findComposer) и
 // шлёт текст в background, который форвардит его C#-серверу по WS.
 //
 // Почему расширение, а не Tampermonkey: WS до localhost открывается из
@@ -31,7 +31,16 @@
 
   console.log("[Gptgraber] content script загружен:", location.href);
 
-  const COMPOSER_SELECTOR = "#prompt-textarea";
+  // Композер: с 10.10.2026 у ProseMirror нет id (#prompt-textarea исчез), есть data-composer-markdown.
+  function findComposer() {
+    const root = findComposerForm() || document;
+    return (
+      root.querySelector("[data-composer-markdown]") ||
+      root.querySelector('.ProseMirror[contenteditable="true"]') ||
+      document.querySelector("#prompt-textarea") ||
+      null
+    );
+  }
   const POLL_MS = 250;   // как часто опрашивать поле
   const SETTLE_MS = 800; // текст не менялся столько -> «ввод завершён», шлём
 
@@ -40,7 +49,7 @@
   let lastSent = null;
 
   function readComposerText() {
-    const el = document.querySelector(COMPOSER_SELECTOR);
+    const el = findComposer();
     if (!el) return null; // поля сейчас нет в DOM
     //   (неразрывный пробел) -> обычный; срезаем хвостовые пробелы/переносы.
     return (el.innerText || "").replace(/ /g, " ").replace(/\s+$/g, "");
@@ -81,7 +90,7 @@
   // обрабатывает штатно. Работает и для фонового таба (delete не требует фокуса окна,
   // в отличие от clipboard-команд).
   function clearComposer() {
-    const el = document.querySelector(COMPOSER_SELECTOR);
+    const el = findComposer();
     if (!el) {
       console.warn("[Gptgraber] очистка: композер не найден");
       return;
@@ -113,6 +122,7 @@
     // Якоря по убыванию надёжности: новый атрибут композера (появился 11.09.2026,
     // не зависит от языка и классов) -> прежний класс с "composer".
     return (
+      document.querySelector("form[data-chatgpt-composer]") ||   // с 10.10.2026
       document.querySelector('form[data-type="unified-composer"]') ||
       [...document.querySelectorAll("form")].find(
         (f) => (f.className || "").includes("composer")
@@ -124,16 +134,21 @@
   // aria-label кнопок диктовки ЛОКАЛИЗОВАН языком интерфейса ChatGPT, а ни id, ни
   // data-testid у них нет (проверено 11.09.2026). Держим набор формулировок по языкам:
   // английский, немецкий, русский. Новый язык интерфейса = новая строка сюда.
+  // Подписи 10.10.2026: покой — Dictate / Diktieren / Диктовать; запись — Cancel dictation /
+  // Diktat abbrechen / Отменить диктовку, Stop dictation / Diktat beenden / Остановить диктовку
+  // и третья «Transcribe and send / Transkribieren und übermitteln / Расшифровать и отправить»
+  // (отправка боту — НЕ наша). Образцы с начала строки: /диктов/ ловил бы и «Диктовать».
   const DICTATION_ARIA = {
-    Start: /start dictation|diktat starten|начать диктов|диктовку начать/i,
-    Submit: /submit dictation|diktat absenden|diktat senden|отправить диктов/i,
-    Cancel: /cancel dictation|diktat abbrechen|отменить диктов/i,
+    Start: /^(dictate|start dictation|diktieren|diktat starten|диктовать|начать диктов)/i,
+    Submit: /^(stop dictation|finish dictation|submit dictation|diktat beenden|diktat absenden|diktat senden|остановить диктов|отправить диктов)/i,
+    Cancel: /^(cancel dictation|diktat abbrechen|отменить диктов)/i,
   };
 
   // Кнопки-иконки композера — позиционный фолбэк на случай, если метки переименуют или
   // переведут: берём всё, что не опознано по id/testid и не имеет своего текста (плюс и
   // отправка отсеиваются по id, pill «Nachdenken» — по тексту). Признак не зависит от языка.
-  // В покое остаются [диктовка, голосовой чат], во время записи — [отмена, отправка диктовки].
+  // С 10.10.2026 у «+» тоже нет id: в покое [+, диктовка, голосовой чат], в записи
+  // [отмена, стоп, расшифровать-и-отправить] — нужная кнопка ВТОРАЯ С КОНЦА, отмена первая.
   function iconButtons() {
     const root = findComposerForm() || document;
     return [...root.querySelectorAll("button")].filter(
@@ -152,10 +167,10 @@
     // Позиционный фолбэк — только когда состояние композера однозначно.
     const icons = iconButtons();
     if (icons.length < 2) return null;
-    const recording = !document.querySelector(COMPOSER_SELECTOR);
-    if (kind === "Start" && !recording) return icons[0];
+    const recording = isRecordingLive();
+    if (kind === "Start" && !recording) return icons[icons.length - 2];
     if (kind === "Cancel" && recording) return icons[0];
-    if (kind === "Submit" && recording) return icons[1];
+    if (kind === "Submit" && recording) return icons[icons.length - 2];
     return null;
   }
 
@@ -172,14 +187,14 @@
   // Запись реально идёт, если в DOM появилась кнопка завершения/отмены диктовки
   // (они существуют ТОЛЬКО во время записи). Лёгкая проверка без шумного лога —
   // её дёргаем в цикле ожидания старта.
+  // Только по кнопкам: прежний второй признак «композер исчез из DOM» с 10.10.2026 ложен —
+  // композер остаётся на месте и во время записи, а #prompt-textarea пропал навсегда.
   function isRecordingLive() {
     const root = findComposerForm() || document;
-    const live = [...root.querySelectorAll("button[aria-label]")].some((b) => {
+    return [...root.querySelectorAll("button[aria-label]")].some((b) => {
       const a = b.getAttribute("aria-label") || "";
       return DICTATION_ARIA.Submit.test(a) || DICTATION_ARIA.Cancel.test(a);
     });
-    // Во время записи композер исчезает из DOM — второй, не зависящий от языка признак.
-    return live || (!document.querySelector(COMPOSER_SELECTOR) && iconButtons().length >= 2);
   }
 
   // После клика Start ждём, пока запись реально начнётся, и сообщаем серверу
@@ -231,7 +246,7 @@
     const root = findComposerForm() || document;
     if (root.querySelector('button[data-testid="composer-speech-button"]')) return true;
     const byAria = [...root.querySelectorAll("button[aria-label]")].some((b) =>
-      /voice mode|voice chat|sprachchat|sprachmodus|голосов/i.test(b.getAttribute("aria-label") || "")
+      /voice mode|voice chat|start voice|sprachchat|sprachmodus|голосов/i.test(b.getAttribute("aria-label") || "")
     );
     if (byAria) return true;
     // Фолбэк без текста: диктовка на месте (значит запись кончилась), кнопки отправки нет

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Gptgraber Voice Bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Читает композер ChatGPT и шлёт текст C#-серверу VoiceBridge по WebSocket (localhost).",
 
   "browser_specific_settings": {
