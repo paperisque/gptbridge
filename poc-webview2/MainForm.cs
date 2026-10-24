@@ -16,7 +16,7 @@ namespace WebView2Poc;
 /// Хоткеи (глобальные, ловит Hotkey):
 ///   Ctrl+Win      — диктовка (старт → говори → стоп → вставка в активное окно);
 ///   Ctrl+Win+«Y»  — то же + текст остаётся в буфере;
-///   Ctrl+Win+Alt  — повторно вставить последний распознанный текст.
+///   Win+Alt  — повторно вставить последний распознанный текст.
 /// Ctrl+Win в промежуточной фазе (готовлю/распознаю) = отмена.
 /// </summary>
 internal sealed class MainForm : Form
@@ -73,7 +73,7 @@ internal sealed class MainForm : Form
         set { _state = value; if (value == LiveState.Idle && _icoWhite != null) _tray.Icon = _icoWhite; }
     }
     private CancellationTokenSource? _cts;
-    private string _lastText = "";          // последний распознанный текст — для Ctrl+Win+Alt
+    private string _lastText = "";          // последний распознанный текст — для Win+Alt
     private bool _firstClearDone;            // черновик композера чистим один раз после загрузки
 
     public MainForm(bool startInTray)
@@ -429,7 +429,7 @@ internal sealed class MainForm : Form
 
             if (GoodText(text))
             {
-                _lastText = text; // запоминаем для повторной вставки (Ctrl+Win+Alt)
+                _lastText = text; // запоминаем для повторной вставки (Win+Alt)
                 bool ok = Injector.Inject(text, target, withY);
                 Win32.FeedbackBeep(ok);
                 OverlaySet(ok ? StatusOverlay.Phase.Done : StatusOverlay.Phase.Error, ok ? null : Lang.T("err.paste_failed"));
@@ -461,7 +461,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    /// <summary>Повторная вставка последнего текста (Ctrl+Win+Alt) — в текущее активное окно.</summary>
+    /// <summary>Повторная вставка последнего текста (Win+Alt) — в текущее активное окно.</summary>
     private void OnRepaste()
     {
         IntPtr target = Win32.GetForegroundWindow();
@@ -767,6 +767,22 @@ internal sealed class MainForm : Form
             Cursor = Cursors.Default,
             Text = HotkeyHelpText(),
         });
+        // Номер версии — в правом верхнем углу справки, на её пустой первой строке; справа отступ
+        // под полосу прокрутки поля. Версия сборки = package.json (см. csproj).
+        var version = new Label
+        {
+            AutoSize = true,
+            BackColor = Color.FromArgb(30, 30, 34),
+            ForeColor = Color.FromArgb(120, 120, 128),
+            Font = new Font("Segoe UI", 9f),
+            Text = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "",
+        };
+        _helpPanel.Controls.Add(version);
+        version.BringToFront();
+        void PlaceVersion() =>
+            version.Location = new Point(_helpPanel.ClientSize.Width - version.Width - 24, 6);
+        _helpPanel.Resize += (_, _) => PlaceVersion();
+        _helpPanel.VisibleChanged += (_, _) => PlaceVersion(); // скрытую панель докинг не раскладывает
         host.Controls.Add(_helpPanel);
         return host;
     }

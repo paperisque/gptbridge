@@ -10,7 +10,7 @@ GPT Grabber embeds ChatGPT directly via **WebView2** (Chromium), drives its dict
 |---|---|
 | **Ctrl+Win** | Dictation: start → speak → stop → paste into the active window |
 | **Ctrl+Win+Y** | Same, but the text also stays in the clipboard |
-| **Ctrl+Win+Alt** | Paste the last recognized text again |
+| **Win+Alt** | Paste the last recognized text again |
 | **Ctrl+Win** (during prepare / recognize) | Cancel |
 
 The same list is available from the **?** button in the app window.

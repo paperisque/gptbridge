@@ -12,7 +12,8 @@ internal static partial class Win32
 {
     // Свои сообщения от хука в окно (PostMessage на hwnd формы; для TOGGLE wParam=1 => вариант +буфер).
     public const uint WM_APP_TOGGLE = 0x8000 + 1;
-    public const uint WM_APP_REPASTE = 0x8000 + 2; // Ctrl+Alt+V — повторно вставить последний текст
+    public const uint WM_APP_REPASTE = 0x8000 + 2; // Win+Alt — повторно вставить последний текст
+    public const uint LLKHF_INJECTED = 0x10;       // флаг KBDLLHOOKSTRUCT: нажатие синтезировано (SendInput)
 
     public static readonly IntPtr HWND_BROADCAST = new(0xFFFF); // PostMessage всем окнам верхнего уровня
 

@@ -4,14 +4,18 @@ namespace WebView2Poc;
 
 /// <summary>
 /// Низкоуровневый хук клавиатуры (WH_KEYBOARD_LL) ради «модификатор-тогглов», которые
-/// RegisterHotKey не умеет. Жест распознаётся на ОТПУСКАНИИ Ctrl+Win (как у WhisperFlow):
-///   • Ctrl+Win            → диктовка (тоггл);
+/// RegisterHotKey не умеет. Два независимых жеста:
+///   • Ctrl+Win            → диктовка (тоггл), на ОТПУСКАНИИ Ctrl или Win (как у WhisperFlow);
 ///   • Ctrl+Win+«Y»        → диктовка с сохранением текста в буфере (по СКАН-КОДУ 0x2C);
-///   • Ctrl+Win+Alt        → повторно вставить последний распознанный текст.
+///   • Win+Alt (без Ctrl)  → повторно вставить последний распознанный текст — когда отпущены
+///                           ОБЕ клавиши: вставка синтезирует Ctrl+V, и зажатые модификаторы
+///                           превратили бы его в Win+Ctrl+V / Ctrl+Alt+V (на DE-раскладке = AltGr).
 /// «Постороннее» нажатие (любая другая клавиша) отменяет жест — тогда это системный
 /// шорткат, и мы его НЕ трогаем. Ничего не «глотаем»: всегда CallNextHookEx, поэтому Пуск
-/// и Ctrl+Win+стрелки работают как обычно. Постим в HWND формы (в WinForms сообщения без
-/// окна до WndProc не доходят).
+/// и Ctrl+Win+стрелки работают как обычно. Синтезированные нажатия (LLKHF_INJECTED — в т.ч.
+/// наш собственный Ctrl+V) жесты не видят: раньше Ctrl из вставки при ещё зажатых Win+Alt
+/// собирал жест заново, и текст вставлялся дважды. Постим в HWND формы (в WinForms сообщения
+/// без окна до WndProc не доходят).
 /// </summary>
 internal sealed class Hotkey : IDisposable
 {
@@ -20,10 +24,15 @@ internal sealed class Hotkey : IDisposable
     private IntPtr _hook;
 
     private bool _ctrl, _win, _alt;
+
+    // Жест Ctrl+Win (диктовка)
     private bool _armed;        // Ctrl+Win зажаты — жест начат
     private bool _yPressed;     // во время жеста нажималась клавиша «+буфер»
-    private bool _altSeen;      // во время жеста участвовал Alt → повторная вставка
     private bool _otherPressed; // нажата посторонняя клавиша → отмена жеста
+
+    // Жест Win+Alt (повторная вставка)
+    private bool _repasteArmed;  // Win+Alt зажаты без Ctrl — жест начат
+    private bool _repasteBroken; // Ctrl или посторонняя клавиша → отмена жеста
 
     public Hotkey(IntPtr targetHwnd)
     {
@@ -42,10 +51,13 @@ internal sealed class Hotkey : IDisposable
         if (nCode >= 0)
         {
             var data = Marshal.PtrToStructure<Win32.KBDLLHOOKSTRUCT>(lParam);
-            uint msg = (uint)wParam.ToInt32();
-            int vk = (int)data.vkCode;
-            if (msg == Win32.WM_KEYDOWN || msg == Win32.WM_SYSKEYDOWN) Down(vk, data.scanCode);
-            else if (msg == Win32.WM_KEYUP || msg == Win32.WM_SYSKEYUP) Up(vk);
+            if ((data.flags & Win32.LLKHF_INJECTED) == 0)
+            {
+                uint msg = (uint)wParam.ToInt32();
+                int vk = (int)data.vkCode;
+                if (msg == Win32.WM_KEYDOWN || msg == Win32.WM_SYSKEYDOWN) Down(vk, data.scanCode);
+                else if (msg == Win32.WM_KEYUP || msg == Win32.WM_SYSKEYUP) Up(vk);
+            }
         }
         return Win32.CallNextHookEx(_hook, nCode, wParam, lParam);
     }
@@ -56,14 +68,18 @@ internal sealed class Hotkey : IDisposable
 
     private void Down(int vk, uint scan)
     {
-        if (IsCtrl(vk)) _ctrl = true;
+        if (IsCtrl(vk)) { _ctrl = true; _repasteBroken = true; }
         else if (IsWin(vk)) _win = true;
-        else if (IsAlt(vk)) { _alt = true; if (_armed) _altSeen = true; }
-        else if (_armed)
+        else if (IsAlt(vk)) _alt = true;
+        else
         {
-            // Скан-код, а не vkCode: позиция клавиши «+буфер» одинакова в любой раскладке.
-            if (scan == Win32.SCAN_KEEPBUFFER) _yPressed = true;
-            else _otherPressed = true;
+            if (_armed)
+            {
+                // Скан-код, а не vkCode: позиция клавиши «+буфер» одинакова в любой раскладке.
+                if (scan == Win32.SCAN_KEEPBUFFER) _yPressed = true;
+                else _otherPressed = true;
+            }
+            _repasteBroken = true;
         }
 
         if (_ctrl && _win && !_armed)
@@ -71,30 +87,37 @@ internal sealed class Hotkey : IDisposable
             _armed = true;
             _yPressed = false;
             _otherPressed = false;
-            _altSeen = _alt; // Alt мог быть зажат ещё до того, как собралось Ctrl+Win
+        }
+
+        if (_win && _alt && !_ctrl && !_repasteArmed)
+        {
+            _repasteArmed = true;
+            _repasteBroken = false;
         }
     }
 
     private void Up(int vk)
     {
-        bool breaking = IsCtrl(vk) || IsWin(vk);
-        if (_armed && breaking)
+        if (_armed && (IsCtrl(vk) || IsWin(vk)))
         {
-            // Комбо распадается. Постороннего не было → решаем по Alt / «+буфер».
+            // Комбо Ctrl+Win распадается. Постороннего не было → диктовка.
             if (!_otherPressed)
-            {
-                if (_altSeen)
-                    Win32.PostMessage(_targetHwnd, Win32.WM_APP_REPASTE, IntPtr.Zero, IntPtr.Zero);
-                else
-                    Win32.PostMessage(_targetHwnd, Win32.WM_APP_TOGGLE,
-                        _yPressed ? new IntPtr(1) : IntPtr.Zero, IntPtr.Zero);
-            }
+                Win32.PostMessage(_targetHwnd, Win32.WM_APP_TOGGLE,
+                    _yPressed ? new IntPtr(1) : IntPtr.Zero, IntPtr.Zero);
             _armed = false;
         }
 
         if (IsCtrl(vk)) _ctrl = false;
         else if (IsWin(vk)) _win = false;
         else if (IsAlt(vk)) _alt = false;
+
+        // Win+Alt — только когда отпущены обе: вставлять при зажатом модификаторе нельзя.
+        if (_repasteArmed && !_win && !_alt)
+        {
+            if (!_repasteBroken)
+                Win32.PostMessage(_targetHwnd, Win32.WM_APP_REPASTE, IntPtr.Zero, IntPtr.Zero);
+            _repasteArmed = false;
+        }
     }
 
     public void Dispose()

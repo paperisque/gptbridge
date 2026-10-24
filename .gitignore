@@ -17,12 +17,6 @@ dist/*.cmd
 web-ext-artifacts/
 # *.xpi
 
-# ---- Установщик (Inno Setup): кэш загружаемого WebView2-бутстраппера ----
-# Сам инсталлятор кладётся в dist/ (уже игнорируется выше).
-tools/cache/
-
-# ---- Отстойник: черновики/мусор вне git (пригодится позже) ----
-tmp/
 
 # ---- Claude Code (личные настройки) ----
 .claude/settings.local.json
@@ -39,7 +33,7 @@ poc-webview2/fonts/*.otf
 !poc-webview2/fonts/Manrope-Bold.ttf
 
 # ---- Не для публичного репозитория ----
-# Демо-ролики (тяжёлые; решим позже, чем делиться) и внутренняя «память» ассистента.
+# Демо-ролики (тяжёлые) и внутренняя «память» ассистента.
 docs/demo.gif
 docs/demo_mini.gif
 docs/demo.mp4
@@ -50,3 +44,13 @@ docs/NEXTMEMORY.md
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- Установщик (Inno Setup): кэш загружаемого WebView2-бутстраппера ----
+# Сам инсталлятор кладётся в dist/ (уже игнорируется выше).
+tools/cache/
+
+# ---- Данные программы (профиль WebView2 с сессией ChatGPT + лог),
+# ----- если DLL запущена не из bin/ ----
+commits/
+data/
+tmp/

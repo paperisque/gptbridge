@@ -16,6 +16,9 @@
     <!-- WFO1000: аналайзер WinForms требует атрибуты сериализации на свойствах кастомных
          контролов (FlatControls.cs) — они только рантайм, дизайнер не используем. -->
     <NoWarn>$(NoWarn);MSB3277;WFO1000</NoWarn>
+    <!-- Версия — одна на всё: из package.json в корне (оттуда же её берёт build-installer.ps1).
+         Показывается в справке по «?». -->
+    <Version>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\package.json')), '"version"\s*:\s*"([0-9.]+)"').Groups[1].Value)</Version>
   </PropertyGroup>
 
   <ItemGroup>
