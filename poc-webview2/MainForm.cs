@@ -1,4 +1,5 @@
-﻿using System.Drawing;
+﻿using System.Diagnostics;
+using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
@@ -25,6 +26,20 @@ internal sealed class MainForm : Form
     private readonly TextBox _log = new();
     private readonly NotifyIcon _tray = new();
     private Icon? _icoWhite, _icoOrange, _icoGreen, _icoBlue, _icoRed; // эквалайзер по фазам (синхрон с пилюлей)
+    private Icon? _icoYellow;                                          // идёт файл куклы (вход FileEntry)
+
+    // Вход «файл → текст» для кукол (FileEntry, HTTP на 127.0.0.1:17891). Задание живёт на UI-потоке:
+    // _fileJob - текущее, _fileTask - его работа (вытеснение ждёт её конца, потом стартует живую диктовку).
+    private FileEntry? _fileEntry;
+    private FileJob? _fileJob;
+    private Task? _fileTask;
+    private DateTime _fileEndsAt;        // оценка конца звука файла - для retryAfterSec другим куклам
+    private DateTime _liveQuietUntil;    // пауза после живой диктовки: куклам «занято», сдвигается каждой диктовкой
+    private const int LiveQuietSec = 10; // решение юзера 09.11.2026
+    private bool _pageReady;             // кнопка Start на месте - опрос раз в 5 с (ReadyPollMs), только в покое
+    private const int ReadyPollMs = 5000;
+    private const int FileChunkChars = 4 * 1024 * 1024;   // base64 в страницу кусками по 4 МБ (проверено разведкой 08.11)
+    private System.Windows.Forms.Timer _readyTimer = null!;
     private Hotkey? _hotkey;
     private bool _exiting;
     private readonly bool _startInTray; // --tray: стартовать сразу свёрнутым в трей
@@ -63,14 +78,26 @@ internal sealed class MainForm : Form
     // уникально по строке — одинаково во всех процессах, поэтому второй шлёт именно его (broadcast).
     public static readonly uint WmShowExisting = Win32.RegisterWindowMessage("GptGrabber.ShowExistingInstance.v1");
 
-    private enum LiveState { Idle, Starting, Recording, Stopping }
+    // File - идёт файл куклы (вход FileEntry); Ctrl+Win в нём = вытеснение файла живой диктовкой.
+    private enum LiveState { Idle, Starting, Recording, Stopping, File }
     private LiveState _state = LiveState.Idle;
+    private static bool IsLive(LiveState s) => s is LiveState.Starting or LiveState.Recording or LiveState.Stopping;
 
     // При возврате в покой иконку трея возвращаем к белой (активные цвета ставят фаза-обёртки).
+    // Живая диктовка кончилась (как угодно: вставкой, отменой, ошибкой) → отсчёт паузы для кукол заново.
     private LiveState State
     {
         get => _state;
-        set { _state = value; if (value == LiveState.Idle && _icoWhite != null) _tray.Icon = _icoWhite; }
+        set
+        {
+            bool wasLive = IsLive(_state);
+            _state = value;
+            if (value == LiveState.Idle)
+            {
+                if (wasLive) _liveQuietUntil = DateTime.Now.AddSeconds(LiveQuietSec);
+                if (_icoWhite != null) _tray.Icon = _icoWhite;
+            }
+        }
     }
     private CancellationTokenSource? _cts;
     private string _lastText = "";          // последний распознанный текст — для Win+Alt
@@ -105,8 +132,11 @@ internal sealed class MainForm : Form
         {
             UserDataFolder = Diag.WebViewDataDir,
             // Не давать Chromium «засыпать» в фоне/свёрнутым — захват микрофона должен идти.
+            // --autoplay-policy: страховка для входа «файл → текст» - AudioContext с файлом стартует без жеста
+            // пользователя (в разведке 08.11 контекст и так был running, но строго это не доказано).
             AdditionalBrowserArguments =
                 "--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
+                + " --autoplay-policy=no-user-gesture-required"
                 + (string.IsNullOrEmpty(dbgPort) ? "" : $" --remote-debugging-port={dbgPort}")
         };
 
@@ -133,7 +163,11 @@ internal sealed class MainForm : Form
         _icoGreen = BuildEqIcon(Color.FromArgb(90, 205, 100)); // идёт запись
         _icoBlue = BuildEqIcon(Color.FromArgb(80, 155, 255));  // распознаю
         _icoRed = BuildEqIcon(Color.FromArgb(235, 80, 80));    // ошибка
+        _icoYellow = BuildEqIcon(Color.FromArgb(240, 200, 60)); // идёт файл куклы
         SetupTray();
+        // Готовность страницы для /status: лёгкий опрос кнопки Start в покое (один маленький скрипт).
+        _readyTimer = new System.Windows.Forms.Timer { Interval = ReadyPollMs };
+        _readyTimer.Tick += async (_, _) => await PollPageReadyAsync();
         Load += async (_, _) => await InitWebViewAsync();
     }
 
@@ -256,6 +290,7 @@ internal sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _hotkey?.Dispose();
+        _fileEntry?.Dispose();
         StatusOverlay.Destroy();
         _tray.Visible = false;
         _tray.Dispose();
@@ -296,6 +331,7 @@ internal sealed class MainForm : Form
                     await Exec(HideExtrasScript);    // спрятать лишний блок под #thread-bottom (CSS живёт в head)
                     await Exec(OverlayInjectScript); // плавающие кнопки (тулбар/справка) в правом нижнем углу
                     await PopulateMicsAsync();       // список микрофонов в тулбар (метки уже доступны — разрешение выдано)
+                    await PollPageReadyAsync();      // /status.ready - сразу, не дожидаясь таймера
                     if (!_firstClearDone)
                     {
                         _firstClearDone = true;
@@ -312,6 +348,8 @@ internal sealed class MainForm : Form
             Log(ok ? Lang.T("log.hotkeys_on") : Lang.T("log.hotkeys_fail"));
             Log(Lang.T("log.profile", Diag.WebViewDataDir));
             Log(Lang.T("hint.login"));
+            _readyTimer.Start();
+            StartFileEntry();
         }
         catch (Exception ex)
         {
@@ -342,6 +380,213 @@ internal sealed class MainForm : Form
                 _cts?.Cancel();
                 Diag.Write("отмена (Ctrl+Win в промежуточной фазе)");
                 break;
+            // Идёт файл куклы → вытеснение: файл обрывается (кукле preempted), сразу живая диктовка.
+            case LiveState.File:
+                Diag.Write("Ctrl+Win во время файла — вытеснение");
+                _fileJob?.Cancel("preempted");
+                _ = PreemptThenStartAsync();
+                break;
+        }
+    }
+
+    /// <summary>Дождаться уборки вытесненного файла (Cancel на странице, замок снят) и начать живую диктовку.</summary>
+    private async Task PreemptThenStartAsync()
+    {
+        if (_fileTask != null) { try { await _fileTask; } catch { /* итог уже ушёл кукле */ } }
+        await StartDictationAsync();
+    }
+
+    // --------------------------- Вход «файл → текст» (куклы) ---------------------------
+
+    private void StartFileEntry()
+    {
+        try
+        {
+            string ver = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "0";
+            // --api-host / --api-port: по умолчанию вся сеть, порт 17891 (решение пользователя 09.11.2026).
+            string? bindErr = FileEntry.ParseBind(Program.GetOption("--api-host"), Program.GetOption("--api-port"), out var bind, out int port);
+            if (bindErr != null) { Log(Lang.T("log.file_entry_fail", bindErr)); return; }
+            _fileEntry = new FileEntry(
+                () => { try { return (FileStatus)Invoke(FileStatusNow); } catch { return new FileStatus(false, "idle", "not_ready", null); } },
+                job => { try { BeginInvoke(new Action(() => SubmitFileJob(job))); } catch (Exception ex) { job.Done.TrySetResult(new FileResult(503, "not_ready", "окно граббера недоступно: " + ex.Message)); } },
+                ver, bind, port);
+            _fileEntry.Start();
+            if (_fileEntry.AllNetworks)
+                Log(Lang.T("log.file_entry_net", port, FileEntry.LocalAddresses()));
+            else
+                Log(Lang.T("log.file_entry", bind.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? "[" + bind + "]" : bind.ToString(), port));
+        }
+        catch (Exception ex)
+        {
+            _fileEntry = null;
+            Log(Lang.T("log.file_entry_fail", ex.Message));
+        }
+    }
+
+    /// <summary>Снимок для /status и замка. Только UI-поток.</summary>
+    private FileStatus FileStatusNow()
+    {
+        string state = _state == LiveState.File ? "file" : _state == LiveState.Idle ? "idle" : "live";
+        string reason = "";
+        int? retry = null;
+        if (state == "live") reason = "live";                                   // без retryAfterSec: длина диктовки неизвестна
+        else if (state == "file") { reason = "file"; retry = SecLeft(_fileEndsAt) + 3; }   // остаток звука + распознавание
+        else if (DateTime.Now < _liveQuietUntil) { reason = "pause"; retry = SecLeft(_liveQuietUntil); }
+        else if (!_pageReady) reason = "not_ready";
+        return new FileStatus(reason == "", state, reason, retry);
+    }
+
+    private static int SecLeft(DateTime t) => Math.Max(1, (int)Math.Ceiling((t - DateTime.Now).TotalSeconds));
+
+    /// <summary>Опрос «кнопка Start на месте» для /status.ready - только в покое (в записи её нет по определению).</summary>
+    private async Task PollPageReadyAsync()
+    {
+        if (_state != LiveState.Idle || _web.CoreWebView2 is null) return;
+        bool ready = (await Exec(StartReadyScript)) == "ready";
+        if (ready != _pageReady) Diag.Write("вход: страница " + (ready ? "готова" : "не готова (нет кнопки Start)"));
+        _pageReady = ready;
+    }
+
+    /// <summary>Задание от FileEntry (UI-поток): замок «занято» или в работу.</summary>
+    private void SubmitFileJob(FileJob job)
+    {
+        var st = FileStatusNow();
+        if (st.State != "idle" || st.Reason == "pause")
+        {
+            string why = st.Reason switch
+            {
+                "live" => "идёт живая диктовка",
+                "file" => "идёт другой файл",
+                _ => "пауза после живой диктовки",
+            };
+            job.Done.TrySetResult(new FileResult(409, "busy", why, RetryAfterSec: st.RetryAfterSec));
+            return;
+        }
+        _fileTask = RunFileAsync(job);
+    }
+
+    /// <summary>
+    /// Файл → текст на странице: тот же путь, что у живой диктовки, но вместо микрофона страница получает
+    /// поток из декодированного WAV (перехватчик getUserMedia, режим файла - одноразовый). Текст никуда не
+    /// вставляется, пилюля не показывается, буфер и фокус не трогаются. Отмена (вытеснение, обрыв клиента)
+    /// → Cancel на странице, замок снят, итог кукле.
+    /// </summary>
+    private async Task RunFileAsync(FileJob job)
+    {
+        _fileJob = job;
+        _fileEndsAt = DateTime.Now.AddSeconds(job.AudioSec + 3);
+        State = LiveState.File;
+        if (_icoYellow != null) _tray.Icon = _icoYellow;
+        var ct = job.Cts.Token;
+        string tag = $"файл {job.Id}";
+        var result = new FileResult(500, "internal", "внутренняя ошибка");
+        Log(Lang.T("log.file_start", job.Client == "" ? "?" : job.Client, job.AudioSec.ToString("0.0", CultureInfo.InvariantCulture)));
+        try
+        {
+            // Зависший UI диктовки (как в StartDictationAsync) - сперва закрыть.
+            if ((await Exec(DictationStateScript)).Contains("\"live\":true"))
+            {
+                Diag.Write($"{tag}: висит UI диктовки — отбой: " + await Exec(CancelScript));
+                await Task.Delay(400, ct);
+            }
+            if (!await PollAsync(StartReadyScript, "ready", 5, 300, ct))
+            {
+                string api = await ProbeBackendAsync();
+                bool sessionBad = api != "200";
+                Diag.Write($"{tag}: кнопка Start не появилась (backend-api/me → {api})");
+                _pageReady = false;
+                result = sessionBad
+                    ? new FileResult(503, "session", $"сессия ChatGPT протухла (backend-api/me → {api}), нужен перелогин")
+                    : new FileResult(503, "not_ready", "ChatGPT не готов: нет кнопки диктовки");
+                return;
+            }
+
+            // Звук в страницу кусками base64, затем декодирование и взвод перехватчика.
+            await Exec(FileResetScript);
+            string b64 = Convert.ToBase64String(job.Wav);
+            for (int i = 0; i < b64.Length; i += FileChunkChars)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Exec("window.__ggFile.push('" + b64.Substring(i, Math.Min(FileChunkChars, b64.Length - i)) + "')");
+            }
+            Diag.Write($"{tag}: {job.Wav.Length} байт передано, arm: " + await Exec(FileArmScript));
+            string fs = "";
+            for (int i = 0; i < 150; i++)   // декодирование 5 мин звука - около секунды; 30 с с запасом
+            {
+                await Task.Delay(200, ct);
+                fs = await Exec(FileStateScript);
+                if (fs == "armed" || fs.StartsWith("error")) break;
+            }
+            if (fs != "armed")
+            {
+                result = new FileResult(400, "bad_file", "страница не декодировала WAV: " + fs);
+                return;
+            }
+
+            await Exec(ClearComposerScript);
+            Diag.Write($"{tag}: Start: " + await Exec(ClickStartScript));
+            if (!await PollAsync(DictationStateScript, "\"live\":true", 20, 300, ct))
+            {
+                Diag.Write($"{tag}: запись не пошла (нет live), file=" + await Exec(FileStateScript));
+                result = new FileResult(503, "not_ready", "запись на странице не пошла");
+                return;
+            }
+            _fileEndsAt = DateTime.Now.AddSeconds(job.AudioSec + 1);
+
+            // Конец звука: флаг onended со страницы; не пришёл за длину + 5 с → стоп по времени.
+            int tries = (int)(job.AudioSec * 4) + 20;
+            if (!await PollAsync(FileStateScript, "ended", tries, 250, ct))
+                Diag.Write($"{tag}: onended не пришёл, стоп по времени (file=" + await Exec(FileStateScript) + ")");
+            Diag.Write($"{tag}: Submit: " + await Exec(SubmitScript));
+
+            // Распознавание: обычно ~3 с. Нет текста и запись на странице не идёт 20 с → empty;
+            // страница всё ещё в записи (кнопки Stop/Cancel на месте) до 60 с → timeout.
+            var rec = Stopwatch.StartNew();
+            string text = "";
+            bool timedOut = false;
+            while (true)
+            {
+                await Task.Delay(500, ct);
+                text = await Exec(ComposerReadScript);
+                if (GoodText(text)) break;
+                bool stillRec = (await Exec(DictationStateScript)).Contains("\"live\":true");
+                if (!stillRec && rec.Elapsed.TotalSeconds >= 20) break;
+                if (rec.Elapsed.TotalSeconds >= 60) { timedOut = true; break; }
+            }
+            if (!GoodText(text))
+            {
+                result = timedOut
+                    ? new FileResult(504, "timeout", "распознавание не завершилось за 60 с")
+                    : new FileResult(422, "empty", "текста нет (тишина?)");
+                return;
+            }
+            result = new FileResult(200, null, null, Text: text, RecognizeMs: (int)rec.ElapsedMilliseconds);
+            await Exec(ClearComposerScript);   // поле к следующей диктовке
+        }
+        catch (OperationCanceledException)
+        {
+            await Exec(CancelScript);          // закрыть UI диктовки, если открылся
+            await Exec(ClearComposerScript);   // недораспознанный хвост не должен приклеиться к следующей диктовке
+            result = job.CancelReason == "preempted"
+                ? new FileResult(409, "preempted", "вытеснен живой диктовкой")
+                : new FileResult(499, "disconnected", "клиент оборвал соединение");
+            Diag.Write($"{tag}: отменён ({job.CancelReason})");
+        }
+        catch (Exception ex)
+        {
+            Diag.Write($"{tag}: ошибка: " + ex);
+            result = new FileResult(500, "internal", ex.Message);
+        }
+        finally
+        {
+            await Exec(FileDisarmScript);      // перехватчик снова отдаёт настоящий микрофон
+            _fileJob = null;
+            State = LiveState.Idle;            // File → Idle паузу не включает (она только после живой)
+            job.Done.TrySetResult(result);
+            if (result.Status == 200)
+                Log(Lang.T("log.file_done", result.Text?.Length ?? 0, result.RecognizeMs));
+            else
+                Log(Lang.T("log.file_fail", result.Error ?? "?", result.Message ?? ""));
         }
     }
 
@@ -802,6 +1047,8 @@ internal sealed class MainForm : Form
             + "•  " + Lang.T("help.flag_lang") + nl
             + "•  " + Lang.T("help.flag_tray") + nl
             + "•  " + Lang.T("help.flag_nobeep") + nl
+            + "•  " + Lang.T("help.flag_api_host") + nl
+            + "•  " + Lang.T("help.flag_api_port") + nl
             + "•  " + Lang.T("help.flag_devtools");
     }
 
@@ -1017,6 +1264,56 @@ var GG = (function () {
         return "wait";
     }
 
+    // ---- Вход «файл → текст»: звук для страницы (window.__ggFile) ----
+    // Порядок: Reset (новый контейнер) → push(b64) кусками → Arm (склеить, декодировать, взвести) →
+    // перехватчик getUserMedia (MicBoostTemplate, режим файла) отдаёт поток из буфера → State: playing → ended
+    // (onended источника) → Disarm (снять, освободить контекст). Всё в window, перерисовки React не задевают.
+    private const string FileResetScript = """
+(function () {
+  var f = window.__ggFile;
+  if (f && f.source) { try { f.source.stop(); } catch (e) {} }
+  if (f && f.ctx) { try { f.ctx.close(); } catch (e) {} }
+  window.__ggFile = { chunks: [], armed: false, buffer: null, ctx: null, source: null, state: 'empty',
+    push: function (b64) { this.chunks.push(b64); return this.chunks.length; } };
+  return 'reset';
+})()
+""";
+
+    private const string FileArmScript = """
+(function () {
+  var f = window.__ggFile;
+  if (!f || !f.chunks.length) return 'no data';
+  f.state = 'decoding';
+  try {
+    var raw = atob(f.chunks.join('')); f.chunks = [];
+    var bytes = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    raw = null;
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    f.ctx = new Ctx();
+    if (f.ctx.state === 'suspended') { try { f.ctx.resume(); } catch (e) {} }
+    f.ctx.decodeAudioData(bytes.buffer).then(
+      function (buf) { f.buffer = buf; f.armed = true; f.state = 'armed'; },
+      function (e) { f.state = 'error: decode ' + (e && e.message); });
+  } catch (e) { f.state = 'error: ' + (e && e.message); }
+  return f.state;
+})()
+""";
+
+    private const string FileStateScript = "(window.__ggFile && window.__ggFile.state) || 'none'";
+
+    private const string FileDisarmScript = """
+(function () {
+  var f = window.__ggFile;
+  if (!f) return 'none';
+  f.armed = false; f.buffer = null;
+  if (f.source) { try { f.source.stop(); } catch (e) {} f.source = null; }
+  if (f.ctx) { try { f.ctx.close(); } catch (e) {} f.ctx = null; }
+  f.state = 'empty';
+  return 'disarmed';
+})()
+""";
+
     // Прочитать распознанный текст из композера.
     private static readonly string ComposerReadScript = Js("""
 (function () {
@@ -1074,6 +1371,24 @@ var GG = (function () {
     window.__ggMicCalls++;
     constraints = constraints || {};
     var wantAudio = !!constraints.audio;
+    // РЕЖИМ ФАЙЛА (вход для кукол): взведён декодированный WAV - вместо микрофона отдаём поток из него,
+    // один раз (armed сбрасывается сразу). В ctx.destination источник НЕ подключён - в колонки ничего.
+    // Старт через 0.6 с: рекордер ChatGPT берёт поток не мгновенно, иначе теряется начало (разведка 08.11).
+    var f = window.__ggFile;
+    if (wantAudio && f && f.armed && f.buffer && f.ctx) {
+      f.armed = false;
+      try {
+        var fsrc = f.ctx.createBufferSource(); fsrc.buffer = f.buffer;
+        var fdest = f.ctx.createMediaStreamDestination();
+        fsrc.connect(fdest);
+        fsrc.onended = function () { f.state = 'ended'; };
+        f.source = fsrc; f.state = 'playing';
+        setTimeout(function () { try { fsrc.start(); } catch (e) { f.state = 'error: start ' + (e && e.message); } }, 600);
+        window.__ggMicTrack = 'file ' + Math.round(f.buffer.duration) + 's';
+        window.__ggMicLast = 'file';
+        return fdest.stream;
+      } catch (e) { f.state = 'error: ' + (e && e.message); window.__ggMicLast = 'file error'; }
+    }
     // ПОЛНЫЙ ОБХОД, когда усиление выключено: ведём себя ровно как обычный браузер —
     // никакого deviceId/NS/AGC/графа. Тогда «Усиление выкл» = честный baseline «как до внедрения».
     if (!wantAudio || !window.__ggMic.enabled) {

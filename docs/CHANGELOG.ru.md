@@ -1,4 +1,6 @@
-# Изменения &nbsp;<sub>[English version → CHANGELOG.md](../CHANGELOG.md)</sub>
+<p align="right"><a href="../CHANGELOG.md">English version</a></p>
+
+# Изменения
 
 Короткая хронология этапов работы. Детали WS-протокола — в [PROTOCOL.md](PROTOCOL.md);
 архитектура, решения и грабли — в [CLAUDE.md](../CLAUDE.md).

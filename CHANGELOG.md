@@ -1,4 +1,6 @@
-# Changelog &nbsp;<sub>Список изменений на русском — в [docs/CHANGELOG.ru.md](docs/CHANGELOG.ru.md)</sub>
+<p align="right"><a href="docs/CHANGELOG.ru.md">Список изменений на русском</a></p>
+
+# Changelog
 
 A short chronology of the work. WS protocol details — in [docs/PROTOCOL.md](docs/PROTOCOL.md);
 architecture, decisions and pitfalls — in [CLAUDE.md](CLAUDE.md).
