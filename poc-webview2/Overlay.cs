@@ -90,13 +90,14 @@ internal static partial class Win32
 /// </summary>
 internal static class StatusOverlay
 {
-    public enum Phase { Preparing, Starting, Recording, Transcribing, Done, Error }
+    // Warn - предупреждение сторожа голоса: запись выключена, а человек говорит (жёлтая, гаснет сама через WarnHideMs).
+    public enum Phase { Preparing, Starting, Recording, Transcribing, Done, Error, Warn }
 
     private const int Height = 36, IconBox = 18, PadLeft = 10, IconTextGap = 5, PadRight = 10;
     private const int CaretGapX = 3, BottomMargin = 16, ScreenEdgePad = 8, BgAlpha = 235;
     private const float BorderWidth = 2.25f, CheckScale = 0.85f, CrossScale = 0.78f;
     private const bool Compact = false;
-    private const uint AnimTickMs = 80, DoneHideMs = 1200, ErrorHideMs = 2500, TranscribeStuckMs = 30000;
+    private const uint AnimTickMs = 80, DoneHideMs = 1200, ErrorHideMs = 2500, TranscribeStuckMs = 30000, WarnHideMs = 3000;
 
     private const string GlyphMic = "";
     private const string GlyphCheck = "";
@@ -166,6 +167,25 @@ internal static class StatusOverlay
     private static AnchorMode _anchorMode;
     private static int _anchorX, _anchorY, _left, _top, _width;
 
+    // Кружок обратного отсчёта справа в пилюле «Идёт запись» (режим «Поток»: тишина, скоро автостоп).
+    // 0 - кружка нет, CountdownDot - кружок без цифры (ручной «Поток»: тишина, автостопа нет). Любая смена фазы (Show/Set) его убирает.
+    public const int CountdownDot = -1;
+    private const int CountBox = 22, CountGap = 6, CountRightPad = 7;
+    private const float CountScale = 0.92f;
+    private static int _countdown;
+    private static bool _visible;
+
+    private static readonly uint ColWarn = Rgb(255, 202, 40);   // жёлтый предупреждения сторожа голоса
+
+    /// <summary>На экране сейчас предупреждение сторожа голоса.</summary>
+    public static bool WarnVisible => _hwnd != IntPtr.Zero && _visible && _phase == Phase.Warn;
+
+    /// <summary>Голос всё ещё слышен - предупреждение держим: отсчёт до скрытия начинается заново.</summary>
+    public static void KeepWarn()
+    {
+        if (WarnVisible) Win32.SetTimer(_hwnd, (UIntPtr)HideTimerId, WarnHideMs, IntPtr.Zero);
+    }
+
     public static void Create()
     {
         if (_hwnd != IntPtr.Zero) return;
@@ -190,18 +210,36 @@ internal static class StatusOverlay
     {
         if (_hwnd == IntPtr.Zero) return;
         ComputeAnchor(anchorWindow);
+        _countdown = 0;
         Apply(phase, null);
     }
 
     public static void Set(Phase phase, string? customText = null)
     {
         if (_hwnd == IntPtr.Zero) return;
+        _countdown = 0;
         Apply(phase, customText);
+    }
+
+    /// <summary>
+    /// Показать справа в пилюле «Идёт запись» мигающий кружок с числом секунд до автостопа; 0 - убрать,
+    /// CountdownDot - кружок без цифры. Работает только поверх видимой пилюли записи; повтор с тем же числом
+    /// ничего не делает (можно звать на каждом опросе).
+    /// </summary>
+    public static void SetCountdown(int seconds)
+    {
+        if (_hwnd == IntPtr.Zero || !_visible || _phase != Phase.Recording) return;
+        if (seconds < CountdownDot) seconds = 0;
+        if (seconds == _countdown) return;
+        _countdown = seconds;
+        Apply(_phase, _text);   // ширина пилюли меняется - пересчитать место и перерисовать
     }
 
     public static void Hide()
     {
         if (_hwnd == IntPtr.Zero) return;
+        _visible = false;
+        _countdown = 0;
         Win32.KillTimer(_hwnd, (UIntPtr)HideTimerId);
         Win32.KillTimer(_hwnd, (UIntPtr)AnimTimerId);
         Win32.ShowWindow(_hwnd, Win32.SW_HIDE);
@@ -224,10 +262,13 @@ internal static class StatusOverlay
             Phase.Recording => Lang.T("overlay.recording"),
             Phase.Transcribing => Lang.T("overlay.transcribing"),
             Phase.Done => Lang.T("overlay.done"),
+            Phase.Warn => Lang.T("overlay.rec_off"),
             _ => Lang.T("overlay.error"),
         };
 
+        _visible = true;
         _width = Compact ? Height : PadLeft + IconBox + IconTextGap + MeasureText(_text) + PadRight;
+        if (!Compact && _countdown != 0) _width += CountGap + CountBox - (PadRight - CountRightPad);
 
         if (_anchorMode == AnchorMode.CaretRight)
         {
@@ -251,7 +292,7 @@ internal static class StatusOverlay
         Win32.SetWindowPos(_hwnd, Win32.HWND_TOPMOST, 0, 0, 0, 0,
             Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_NOACTIVATE | Win32.SWP_SHOWWINDOW);
 
-        bool animated = phase is Phase.Preparing or Phase.Starting or Phase.Recording or Phase.Transcribing;
+        bool animated = phase is Phase.Preparing or Phase.Starting or Phase.Recording or Phase.Transcribing or Phase.Warn;
         if (animated) Win32.SetTimer(_hwnd, (UIntPtr)AnimTimerId, AnimTickMs, IntPtr.Zero);
         else Win32.KillTimer(_hwnd, (UIntPtr)AnimTimerId);
 
@@ -259,6 +300,7 @@ internal static class StatusOverlay
         if (phase == Phase.Done) Win32.SetTimer(_hwnd, (UIntPtr)HideTimerId, DoneHideMs, IntPtr.Zero);
         else if (phase == Phase.Error) Win32.SetTimer(_hwnd, (UIntPtr)HideTimerId, ErrorHideMs, IntPtr.Zero);
         else if (phase == Phase.Transcribing) Win32.SetTimer(_hwnd, (UIntPtr)HideTimerId, TranscribeStuckMs, IntPtr.Zero);
+        else if (phase == Phase.Warn) Win32.SetTimer(_hwnd, (UIntPtr)HideTimerId, WarnHideMs, IntPtr.Zero);
     }
 
     private static void ComputeAnchor(IntPtr anchorWindow)
@@ -316,7 +358,8 @@ internal static class StatusOverlay
             float inset = BorderWidth / 2 + 0.25f;
             using var pill = PillPath(inset, inset, _width - 2 * inset, Height - 2 * inset);
             using (var bg = new SolidBrush(FromColorRef(ColBg, BgAlpha))) g.FillPath(bg, pill);
-            using (var border = new Pen(FromColorRef(ColBorder), BorderWidth)) g.DrawPath(border, pill);
+            // Предупреждение - рамка жёлтая и пульсирует вместе со значком: пилюлю не спутать с «Идёт запись».
+            using (var border = new Pen(FromColorRef(_phase == Phase.Warn ? Pulse(ColWarn) : ColBorder), BorderWidth)) g.DrawPath(border, pill);
 
             float iconCx = Compact ? _width / 2f : PadLeft + IconBox / 2f;
             float iconCy = Height / 2f;
@@ -328,6 +371,17 @@ internal static class StatusOverlay
                 case Phase.Transcribing: DrawGlyph(g, StarFont, StarFrame(), iconCx, iconCy, ColBusy); break;
                 case Phase.Done: DrawGlyph(g, IconFont, GlyphCheck, iconCx, iconCy, ColRec, CheckScale); break;
                 case Phase.Error: DrawGlyph(g, IconFont, GlyphCross, iconCx, iconCy, ColErr, CrossScale); break;
+                case Phase.Warn:
+                {
+                    // Перечёркнутый микрофон: глиф + косая черта (под ней - полоса цвета фона, чтобы черта не сливалась с глифом).
+                    uint col = Pulse(ColWarn);
+                    DrawGlyph(g, IconFont, GlyphMic, iconCx, iconCy, col);
+                    float r = IconBox / 2f;
+                    using (var gap = new Pen(FromColorRef(ColBg), 4.5f)) g.DrawLine(gap, iconCx - r, iconCy - r, iconCx + r, iconCy + r);
+                    using (var slash = new Pen(FromColorRef(col), 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        g.DrawLine(slash, iconCx - r, iconCy - r, iconCx + r, iconCy + r);
+                    break;
+                }
             }
 
             if (!Compact)
@@ -335,6 +389,15 @@ internal static class StatusOverlay
                 using var brush = new SolidBrush(FromColorRef(ColText));
                 using var sf = new StringFormat { LineAlignment = StringAlignment.Center };
                 g.DrawString(_text, TextFont, brush, new PointF(PadLeft + IconBox + IconTextGap, Height / 2f), sf);
+
+                if (_countdown != 0)
+                {
+                    // Залитый кружок мигает (около раза в секунду), цифра - цветом фона пилюли; CountdownDot - без цифры.
+                    float cx = _width - CountRightPad - CountBox / 2f, cy = Height / 2f;
+                    using (var fill = new SolidBrush(FromColorRef(Blink(ColWait))))
+                        g.FillEllipse(fill, cx - CountBox / 2f, cy - CountBox / 2f, CountBox, CountBox);
+                    if (_countdown > 0) DrawGlyph(g, TextFont, _countdown.ToString(), cx, cy, ColBg, CountScale);
+                }
             }
         }
         Push(bmp);
@@ -411,6 +474,10 @@ internal static class StatusOverlay
         double f = 0.65 + 0.35 * (0.5 + 0.5 * Math.Sin(_animTick * 2 * Math.PI / 16));
         return Dim(color, f);
     }
+
+    // Мигание кружка отсчёта: глубже и чаще пульса микрофона (период 12 тиков ≈ 1 с).
+    private static uint Blink(uint color) =>
+        Dim(color, 0.4 + 0.6 * (0.5 + 0.5 * Math.Sin(_animTick * 2 * Math.PI / 12)));
 
     private static uint Dim(uint color, double f) =>
         Rgb((int)((color & 0xFF) * f), (int)(((color >> 8) & 0xFF) * f), (int)(((color >> 16) & 0xFF) * f));

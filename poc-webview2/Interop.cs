@@ -13,6 +13,7 @@ internal static partial class Win32
     // Свои сообщения от хука в окно (PostMessage на hwnd формы; для TOGGLE wParam=1 => вариант +буфер).
     public const uint WM_APP_TOGGLE = 0x8000 + 1;
     public const uint WM_APP_REPASTE = 0x8000 + 2; // Win+Alt — повторно вставить последний текст
+    public const uint WM_APP_MOVE = 0x8000 + 3;    // Shift+Win - перенести приёмник потока в текущее окно
     public const uint LLKHF_INJECTED = 0x10;       // флаг KBDLLHOOKSTRUCT: нажатие синтезировано (SendInput)
 
     public static readonly IntPtr HWND_BROADCAST = new(0xFFFF); // PostMessage всем окнам верхнего уровня
@@ -22,6 +23,7 @@ internal static partial class Win32
     public const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
     public const int VK_CONTROL = 0x11, VK_LCONTROL = 0xA2, VK_RCONTROL = 0xA3, VK_LWIN = 0x5B, VK_RWIN = 0x5C;
     public const int VK_MENU = 0x12, VK_LMENU = 0xA4, VK_RMENU = 0xA5; // Alt: общий / левый / правый (AltGr)
+    public const int VK_SHIFT = 0x10, VK_LSHIFT = 0xA0, VK_RSHIFT = 0xA1;
     // Клавиша «+буфер» по СКАН-КОДУ (позиция не зависит от раскладки; vk гуляет DE/RU).
     public const uint SCAN_KEEPBUFFER = 0x2C;
 
@@ -82,6 +84,7 @@ internal static partial class Win32
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); // окно консоли хоста dotnet.exe (прячем на старте)
 
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk); // старший бит: клавиша физически зажата сейчас
     [DllImport("user32.dll", SetLastError = true)] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool AttachThreadInput(uint a, uint b, bool f);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool SetForegroundWindow(IntPtr h);
@@ -90,12 +93,69 @@ internal static partial class Win32
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+
+    // Слежение за сменой активного окна (меню трея: команда идёт в окно, где человек был до клика по трею).
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003, WINEVENT_OUTOFCONTEXT = 0x0000;
+    public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint evMin, uint evMax, IntPtr hmod, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] p, int cb);
     [DllImport("user32.dll")] public static extern bool MessageBeep(uint t);
 
-    [DllImport("kernel32.dll")] private static extern bool Beep(uint dwFreq, uint dwDuration);
+    [DllImport("winmm.dll")] private static extern bool PlaySound(byte[] pszSound, IntPtr hmod, uint fdwSound);
+    private const uint SND_SYNC = 0x0000, SND_NODEFAULT = 0x0002, SND_MEMORY = 0x0004;
+    private static readonly object ToneLock = new();
+    public static double BeepVolume = 0.25;   // доля от полной громкости (у kernel32 Beep громкость не задавалась)
+
+    /// <summary>
+    /// Свой тон вместо kernel32 Beep (21.11.2026): системный Beep у пользователя до колонок не доходил вовсе
+    /// (идёт отдельной дорогой, мимо обычного вывода программы). Синус с короткими фронтами собираем в WAV
+    /// в памяти и играем через winmm PlaySound - это обычный звук программы. Синхронно, как прежний Beep.
+    /// </summary>
+    private static void Beep(uint freq, uint durationMs)
+    {
+        const int rate = 44100;
+        int n = (int)(rate * durationMs / 1000), fade = Math.Min(rate * 6 / 1000, n / 2);
+        using var ms = new System.IO.MemoryStream(44 + n * 2);
+        using var w = new System.IO.BinaryWriter(ms);
+        w.Write("RIFF"u8); w.Write(36 + n * 2); w.Write("WAVEfmt "u8); w.Write(16);
+        w.Write((short)1); w.Write((short)1); w.Write(rate); w.Write(rate * 2); w.Write((short)2); w.Write((short)16);
+        w.Write("data"u8); w.Write(n * 2);
+        for (int i = 0; i < n; i++)
+        {
+            double env = i < fade ? (double)i / fade : i >= n - fade ? (double)(n - 1 - i) / fade : 1.0;
+            w.Write((short)(Math.Sin(2 * Math.PI * freq * i / rate) * env * BeepVolume * short.MaxValue));
+        }
+        w.Flush();
+        lock (ToneLock) PlaySound(ms.ToArray(), IntPtr.Zero, SND_MEMORY | SND_SYNC | SND_NODEFAULT);
+    }
 
     public static bool BeepEnabled = true; // --no-beep глушит звуковой отклик
+
+    /// <summary>Один короткий пик: цифра отсчёта до автостопа в «Потоке-авто» (раз в секунду) и напоминание
+    /// ручного «Потока» (раз в 5 с тишины). Был двойной «пи-пик» - пользователь 21.11.2026: «не двойные, а
+    /// одинарные». На фоновом потоке.</summary>
+    public static void CountBeep()
+    {
+        if (!BeepEnabled) return;
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try { Beep(880, 70); }
+            catch { /* нет аудиоустройства/занято — не критично */ }
+        });
+    }
+
+    /// <summary>Пик сторожа голоса: запись выключена, а человек заговорил. Восходящая пара, выше прочих сигналов.</summary>
+    public static void VoiceBeep()
+    {
+        if (!BeepEnabled) return;
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try { Beep(988, 90); Thread.Sleep(40); Beep(1319, 140); }
+            catch { /* нет аудиоустройства/занято — не критично */ }
+        });
+    }
     /// <summary>Свой звуковой отклик (НЕ системный MessageBeep — тот звучит «как ошибка» и сбивает):
     /// успех — короткий ВОСХОДЯЩИЙ тон (позитивный), ошибка — низкий короткий. На фоновом потоке,
     /// чтобы не блокировать вставку. Молчит при --no-beep.</summary>
@@ -208,6 +268,35 @@ internal static class Injector
             Clip.SetUnicodeText(previous, out _);
         }
         return true;
+    }
+
+    /// <summary>Потоковый режим: вставить порцию, НЕ возвращая буфер (его вернёт вызывающий в конце диктовки:
+    /// порций много, и возврат после каждой гонял бы буфер туда-сюда). force=false - только в уже активное окно
+    /// (окно не поднимаем: человек ушёл в другое - порция ждёт); force=true - поднять приёмник (хвост на стопе).
+    /// previous - прежний текст буфера (нужен от первой порции).</summary>
+    public static bool PasteChunk(string text, IntPtr target, bool force, out string? previous)
+    {
+        previous = null;
+        if (target == IntPtr.Zero || !Win32.IsWindow(target) || string.IsNullOrEmpty(text)) return false;
+        if (!force && Win32.GetForegroundWindow() != target) return false;
+        previous = Clip.SetUnicodeText(text, out bool ok);
+        if (!ok) return false;
+        if (force)
+        {
+            ForceForeground(target);
+            Thread.Sleep(ForegroundSettleMs);
+        }
+        SendCtrlV();
+        return true;
+    }
+
+    /// <summary>Зажат ли сейчас Ctrl, Win, Alt или Shift. Синтезированный Ctrl+V поверх зажатой клавиши стал бы
+    /// другой комбинацией (Win+Ctrl+V, Ctrl+Shift+V) - порцию потока в этот момент не шлём.</summary>
+    public static bool ModifierDown()
+    {
+        foreach (int vk in new[] { Win32.VK_CONTROL, Win32.VK_LWIN, Win32.VK_RWIN, Win32.VK_MENU, Win32.VK_SHIFT })
+            if ((Win32.GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+        return false;
     }
 
     public static bool ForceForeground(IntPtr target)

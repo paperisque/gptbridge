@@ -1,20 +1,59 @@
 <p align="right"><a href="docs/README.ru.md">Описание на русском</a></p>
 
-# GPT Grabber
+<p align="center">
+  <img src="poc-webview2/icons/ico2.png" width="96" alt="GPT Grabber">
+</p>
 
-**Voice input for the whole computer: you dictate, ChatGPT recognizes, the text lands in the window you work in. One hotkey.**
+<h1 align="center">GPT Grabber</h1>
 
-GPT Grabber embeds ChatGPT through **WebView2** (the Chromium engine built into Windows), presses its dictation buttons for you, reads back the recognized text and pastes it into the active window: VS Code, an editor, a messenger, anything. It is a single tray app. No external browser, no extension, no server to babysit.
+<p align="center">
+  <b>Voice input for the whole computer.</b><br>
+  You dictate, ChatGPT recognizes, the text lands in the window you work in. One hotkey.
+</p>
 
-Since version 0.1.8 it also has a **door for other programs**: an HTTP entry that takes an audio file and returns the text. Programs on this computer and on other computers in the network can knock. Your scripts, bots and helpers can use the same ChatGPT recognition you dictate with. Details in [Recognize a file from another program](#recognize-a-file-from-another-program).
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.1.9-81d4fa?style=flat-square" alt="version 0.1.9">
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
+  <img src="https://img.shields.io/badge/.NET-10-512BD4?style=flat-square&logo=dotnet&logoColor=white" alt=".NET 10">
+  <img src="https://img.shields.io/badge/UI-en%20%7C%20de%20%7C%20ru-555?style=flat-square" alt="en | de | ru">
+</p>
+
+<p align="center">
+  <a href="https://github.com/paperisque/gptbridge/raw/master/dist/GptGrabber-Setup-0.1.9.exe"><img src="https://img.shields.io/badge/Download-GPT%20Grabber%200.1.9-2ea44f?style=for-the-badge" alt="Download GPT Grabber 0.1.9"></a>
+</p>
+
+<p align="center">
+  <a href="#whats-new-in-019">What's new</a> ·
+  <a href="#hotkeys">Hotkeys</a> ·
+  <a href="#dictation-modes">Modes</a> ·
+  <a href="#tray-menu">Tray menu</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#recognize-a-file-from-another-program">Files from other programs</a> ·
+  <a href="#good-to-know">Good to know</a>
+</p>
+
+---
+
+GPT Grabber embeds ChatGPT through **WebView2** (the Chromium engine built into Windows), presses its dictation buttons for you, reads back the recognized text and pastes it into the active window: VS Code, an editor, a messenger, anything. One small tray app. No external browser, no extension, no server to babysit.
+
+## What's new in 0.1.9
+
+- **Stream modes.** Words appear in your window while you speak. *Stream auto* stops by itself after 6 seconds of silence and starts again when you speak, without losing the beginning of the phrase. → [Dictation modes](#dictation-modes)
+- **Tray menu.** Every hotkey command is one click away, plus mode and sound switches. → [Tray menu](#tray-menu)
+- **New help.** The **?** panel is now a tidy page with keycaps, the version and a link to this repository.
+- **Sound switch.** All beeps on and off from the tray menu; the choice is remembered.
+
+The full history is in the [changelog](CHANGELOG.md).
 
 ## Why it's useful
 
-- **ChatGPT quality, everywhere.** Punctuation, many languages, decent handling of mumbling. Not only inside the chat, but in any application.
-- **No separate paid dictation tool.** You reuse the dictation already built into your ChatGPT account (similar in spirit to WhisperFlow).
-- **You never leave your work.** One hotkey from any app. The window stays in the tray, the microphone works while it is hidden.
-- **You see what's going on.** A small "pill" next to the caret or at the bottom of the screen: preparing, recording, recognizing, pasted. The tray icon changes color in sync.
-- **Other programs can use it too.** An HTTP entry turns a WAV file into text for programs on this computer and in the network, with a polite queue: your own dictation always comes first.
+| | |
+|---|---|
+| 🎯 **ChatGPT quality, everywhere** | Punctuation, many languages, decent handling of mumbling. Not only inside the chat, but in any application. |
+| 💸 **No separate paid dictation tool** | You reuse the dictation already built into your ChatGPT account (similar in spirit to WhisperFlow). |
+| ⌨️ **You never leave your work** | One hotkey from any app. The window stays in the tray, the microphone works while it is hidden. |
+| 👀 **You see what's going on** | A small "pill" next to the caret or at the bottom of the screen: preparing, recording, recognizing, pasted. The tray icon changes color in sync. |
+| 🔌 **Other programs can use it too** | An HTTP entry turns a WAV file into text for programs on this computer and in the network, with a polite queue: your own dictation always comes first. |
 
 ## Hotkeys
 
@@ -23,13 +62,30 @@ Since version 0.1.8 it also has a **door for other programs**: an HTTP entry tha
 | **Ctrl+Win** | Dictation: start → speak → stop → paste into the active window |
 | **Ctrl+Win+Y** | Same, but the text also stays in the clipboard |
 | **Win+Alt** | Paste the last recognized text again |
+| **Shift+Win** (during Stream) | Continue the stream in the window you are in now |
 | **Ctrl+Win** (while preparing / recognizing) | Cancel |
 
 The same list is behind the **?** button in the app window. The "+clipboard" key is matched by its physical position, so it works on any keyboard layout (Y on German, Z on English, Я on Russian).
 
+## Dictation modes
+
+Two round buttons in the bottom right corner of the ChatGPT window switch the mode. The app always starts in **Normal**.
+
+- **Normal.** The text is pasted once, after you stop.
+- **Stream.** Words are pasted while you speak, roughly every half second. Recording never ends by itself; after 5 seconds of silence a single beep reminds you every 5 seconds that the microphone is still on. For 5 minutes after you stop, speaking reminds you that recording is off.
+- **Stream auto.** Like Stream, but 6 seconds without new words end the recording (a countdown in the pill, a beep every 2 seconds). For 5 minutes after that your voice starts recording again by itself, and the beginning of the phrase is kept: the app listens with a short buffer and hands it over to ChatGPT. Stopping with Ctrl+Win puts the auto start to sleep until your next own start.
+
+Clicking the **Stream** button opens a small choice above it: Stream auto or Stream. A yellow "A" on the button marks Stream auto.
+
+## Tray menu
+
+A single click on the tray icon (left or right) opens a menu with the same commands as the hotkeys: start, stop and paste, stop and keep in clipboard, cancel, paste again, continue the stream in another window. The list follows the current state. Below them: the three modes, **Sound** on/off, Show, Exit. A double click opens the window.
+
+A command from the menu goes to the window you were in before clicking the tray: the app remembers it, brings it back to the front and the caret returns to where it was.
+
 ## Install
 
-Build the installer with one command from the repository root:
+**Download** the ready installer: [GptGrabber-Setup-0.1.9.exe](https://github.com/paperisque/gptbridge/raw/master/dist/GptGrabber-Setup-0.1.9.exe) (about 53 MB). Or build it yourself with one command from the repository root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1
@@ -61,7 +117,7 @@ Flags go **after** the DLL path: `dotnet "…\WebView2Poc.dll" <flags>`.
 
 - `--lang en|de|ru` sets the UI language. By default it follows Windows.
 - `--tray` starts hidden in the tray.
-- `--no-beep` turns off the confirmation sound on paste.
+- `--no-beep` turns off all sounds at startup (the same as **Sound** in the tray menu).
 - `--api-host ADDR` sets where the entry for other programs listens. The default is `0.0.0.0`, the whole network. `127.0.0.1` keeps the entry for this computer only.
 - `--api-port N` sets the entry port. The default is `17891`.
 - `--devtools-port N` opens the Chromium debugging port on `127.0.0.1:N`, to inspect the embedded page when ChatGPT changes its markup. **Keep it off unless you are debugging:** while it is open, any program on this computer can drive the page and reach your ChatGPT session.
@@ -180,7 +236,7 @@ Do not press the dictation buttons on the ChatGPT page by hand while a file is r
 
 - **Tray app.** Closing the window (×) hides it to the tray. Exit via the tray menu.
 - **Single instance.** Launching it again brings the running copy out of the tray instead of starting a second one.
-- **Paste sound.** A short two-tone chime confirms a paste. Turn it off with `--no-beep`.
+- **Sounds.** A short two-tone chime confirms a paste; single beeps count down and remind you in the stream modes. **Sound** in the tray menu turns them all off and on, the choice is remembered. `--no-beep` turns them off at startup.
 - **Tidier ChatGPT.** The embedded page hides some clutter around the composer so it does not jump around in a small window.
 - **Data location.** The ChatGPT profile and the log `poc.log` live next to the program in a `data` folder: `%LOCALAPPDATA%\GptGrabber\data` for the installed app, `poc-webview2\bin\Debug\net10.0-windows\data` for a dev build. Uninstalling removes it.
 - **No console window.** The app is launched through console-mode `dotnet.exe`, so it relaunches itself windowless at startup. A brief flash is possible.

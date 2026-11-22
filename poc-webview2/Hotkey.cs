@@ -10,6 +10,8 @@ namespace WebView2Poc;
 ///   • Win+Alt (без Ctrl)  → повторно вставить последний распознанный текст — когда отпущены
 ///                           ОБЕ клавиши: вставка синтезирует Ctrl+V, и зажатые модификаторы
 ///                           превратили бы его в Win+Ctrl+V / Ctrl+Alt+V (на DE-раскладке = AltGr).
+///   • Shift+Win (без Ctrl и Alt) → перенести приёмник потока в текущее окно - тоже когда отпущены ОБЕ:
+///                           следом идёт вставка накопленных слов, а Ctrl+V при зажатом Shift - это Ctrl+Shift+V.
 /// «Постороннее» нажатие (любая другая клавиша) отменяет жест — тогда это системный
 /// шорткат, и мы его НЕ трогаем. Ничего не «глотаем»: всегда CallNextHookEx, поэтому Пуск
 /// и Ctrl+Win+стрелки работают как обычно. Синтезированные нажатия (LLKHF_INJECTED — в т.ч.
@@ -23,7 +25,7 @@ internal sealed class Hotkey : IDisposable
     private readonly Win32.LowLevelKeyboardProc _proc; // держим от GC
     private IntPtr _hook;
 
-    private bool _ctrl, _win, _alt;
+    private bool _ctrl, _win, _alt, _shift;
 
     // Жест Ctrl+Win (диктовка)
     private bool _armed;        // Ctrl+Win зажаты — жест начат
@@ -33,6 +35,10 @@ internal sealed class Hotkey : IDisposable
     // Жест Win+Alt (повторная вставка)
     private bool _repasteArmed;  // Win+Alt зажаты без Ctrl — жест начат
     private bool _repasteBroken; // Ctrl или посторонняя клавиша → отмена жеста
+
+    // Жест Shift+Win (перенос приёмника потока)
+    private bool _moveArmed;     // Shift+Win зажаты без Ctrl и Alt - жест начат
+    private bool _moveBroken;    // Ctrl, Alt или посторонняя клавиша (Win+Shift+S, Win+Shift+стрелки) → отмена жеста
 
     public Hotkey(IntPtr targetHwnd)
     {
@@ -65,12 +71,20 @@ internal sealed class Hotkey : IDisposable
     private static bool IsCtrl(int vk) => vk == Win32.VK_LCONTROL || vk == Win32.VK_RCONTROL || vk == Win32.VK_CONTROL;
     private static bool IsWin(int vk) => vk == Win32.VK_LWIN || vk == Win32.VK_RWIN;
     private static bool IsAlt(int vk) => vk == Win32.VK_MENU || vk == Win32.VK_LMENU || vk == Win32.VK_RMENU;
+    private static bool IsShift(int vk) => vk == Win32.VK_SHIFT || vk == Win32.VK_LSHIFT || vk == Win32.VK_RSHIFT;
 
     private void Down(int vk, uint scan)
     {
-        if (IsCtrl(vk)) { _ctrl = true; _repasteBroken = true; }
+        if (IsCtrl(vk)) { _ctrl = true; _repasteBroken = true; _moveBroken = true; }
         else if (IsWin(vk)) _win = true;
-        else if (IsAlt(vk)) _alt = true;
+        else if (IsAlt(vk)) { _alt = true; _moveBroken = true; }
+        else if (IsShift(vk))
+        {
+            // Для двух старых жестов Shift - посторонняя клавиша, как и раньше.
+            _shift = true;
+            if (_armed) _otherPressed = true;
+            _repasteBroken = true;
+        }
         else
         {
             if (_armed)
@@ -80,6 +94,7 @@ internal sealed class Hotkey : IDisposable
                 else _otherPressed = true;
             }
             _repasteBroken = true;
+            _moveBroken = true;
         }
 
         if (_ctrl && _win && !_armed)
@@ -93,6 +108,12 @@ internal sealed class Hotkey : IDisposable
         {
             _repasteArmed = true;
             _repasteBroken = false;
+        }
+
+        if (_win && _shift && !_ctrl && !_alt && !_moveArmed)
+        {
+            _moveArmed = true;
+            _moveBroken = false;
         }
     }
 
@@ -110,6 +131,7 @@ internal sealed class Hotkey : IDisposable
         if (IsCtrl(vk)) _ctrl = false;
         else if (IsWin(vk)) _win = false;
         else if (IsAlt(vk)) _alt = false;
+        else if (IsShift(vk)) _shift = false;
 
         // Win+Alt — только когда отпущены обе: вставлять при зажатом модификаторе нельзя.
         if (_repasteArmed && !_win && !_alt)
@@ -117,6 +139,14 @@ internal sealed class Hotkey : IDisposable
             if (!_repasteBroken)
                 Win32.PostMessage(_targetHwnd, Win32.WM_APP_REPASTE, IntPtr.Zero, IntPtr.Zero);
             _repasteArmed = false;
+        }
+
+        // Shift+Win - тоже только когда отпущены обе.
+        if (_moveArmed && !_win && !_shift)
+        {
+            if (!_moveBroken)
+                Win32.PostMessage(_targetHwnd, Win32.WM_APP_MOVE, IntPtr.Zero, IntPtr.Zero);
+            _moveArmed = false;
         }
     }
 

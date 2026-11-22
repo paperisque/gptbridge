@@ -21,6 +21,8 @@ web-ext-artifacts/
 # ---- Claude Code (личные настройки) ----
 .claude/settings.local.json
 .claude/beep-disabled
+# Файлы длинных задач ассистента (состояние и план) - внутреннее, не для публичного репозитория
+.claude/tasks/
 
 # ---- Приватные шрифты индикатора (могут быть проприетарными — не коммитим) ----
 server-csharp/VoiceBridge/fonts/*.ttf
@@ -31,6 +33,9 @@ poc-webview2/fonts/*.otf
 !poc-webview2/fonts/Rubik-Regular.ttf
 # Manrope — шрифт подписи пилюли, свободный (SIL OFL, лицензия рядом)
 !poc-webview2/fonts/Manrope-Bold.ttf
+# Montserrat — шрифт справки (окно «?»), свободный (SIL OFL, лицензия рядом)
+!poc-webview2/fonts/Montserrat-Variable.ttf
+!poc-webview2/fonts/Montserrat-Regular.ttf
 
 # ---- Не для публичного репозитория ----
 # Демо-ролики (тяжёлые) и внутренняя «память» ассистента.

@@ -5,6 +5,31 @@
 A short chronology of the work. WS protocol details — in [docs/PROTOCOL.md](docs/PROTOCOL.md);
 architecture, decisions and pitfalls — in [CLAUDE.md](CLAUDE.md).
 
+## 2026-11-22 - GPT Grabber 0.1.9: stream modes, voice auto start, tray menu, new help
+
+- **Stream modes.** Two buttons in the bottom right corner of the ChatGPT window: Normal (paste after stop)
+  and Stream (words are pasted while you speak). Clicking Stream offers two variants. *Stream*: recording
+  never ends by itself, a single beep every 5 s of silence. *Stream auto*: 6 s without new words end the
+  recording (countdown in the pill, a beep every 2 s). Silence is measured by the composer text, not by
+  sound, so room noise does not keep recording alive. Shift+Win moves the stream to the window you are in.
+- **Voice auto start with a buffer.** For 5 minutes after an auto stop the app listens to the microphone;
+  about a second of sustained voice starts recording again. The voice is kept in a 15 s ring buffer and
+  handed to ChatGPT instead of a fresh capture, so the beginning of the phrase is not lost; the lag is
+  eaten by skipping pauses, and the tail is played out before stop. A manual Ctrl+Win stop puts the auto
+  start to sleep until the next manual start. In manual Stream speaking only reminds you that recording is off.
+- **Tray menu.** A single click (left or right) opens a menu with every hotkey command, chosen by the
+  current state, plus the three modes, Sound on/off, Show and Exit. A command goes to the window you were
+  in before clicking the tray: the app tracks the last active window and brings it back first, the caret
+  returns to its place. Dark custom-drawn menu with rounded corners (Windows 11), font Montserrat.
+- **Sound switch.** Sound in the tray menu turns all beeps off and on and is remembered; `--no-beep`
+  still silences them at startup. Beeps now go through `PlaySound` (the system `Beep` did not reach some
+  speakers).
+- **New help.** The **?** panel is now a small web page in a second WebView2 (font Montserrat, keys drawn
+  as keycaps, sections as cards), with the version and a link to the repository. It is preloaded in the
+  background at startup; a spinner shows while it is still loading.
+- **Bigger floating buttons.** The page buttons (modes, mic panel, **?**) are 44 px instead of 36 and sit
+  together in the bottom right corner.
+
 ## 2026-09-11 — ChatGPT composer rebuilt: resilient button lookup and session diagnosis
 
 ChatGPT rolled out a "unified composer": the form gained `data-type="unified-composer"`, a new

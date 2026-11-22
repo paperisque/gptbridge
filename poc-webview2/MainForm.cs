@@ -173,16 +173,157 @@ internal sealed class MainForm : Form
 
     // ------------------------------ Трей ------------------------------
 
+    // Меню трея дублирует все команды клавиш и переключатель режимов (просьба пользователя 22.11.2026: «все команды,
+    // которые делаются с помощью комбинации клавиш, продублировались в менюхе», «и переключатель режимов там добавь»).
+    // Состав меню собирается заново при каждом открытии - по состоянию диктовки, как ведёт себя Ctrl+Win.
+    // Открывается одиночным щелчком левой или правой кнопкой; двойной щелчок - окно программы, как раньше.
+    // Цель вставки: при клике по трею активной становится панель задач, поэтому программа всё время помнит
+    // последнее активное окно человека (_lastUserWin) и по выбору пункта СРАЗУ возвращает его на передний план -
+    // Windows сама ставит фокус и текстовый курсор туда, где они были в этом окне; дальше команда идёт тем же
+    // путём, что и от клавиш (решение пользователя 22.11.2026). Указатель мыши не трогаем.
+
+    private readonly ContextMenuStrip _trayMenu = new();
+    private readonly System.Windows.Forms.Timer _trayClickTimer = new();
+    private IntPtr _lastUserWin;
+    private IntPtr _fgHook;
+    private Win32.WinEventProc? _fgProc;   // держим от GC, как делегат хука клавиатуры
+
     private void SetupTray()
     {
-        var menu = new ContextMenuStrip();
-        menu.Items.Add(Lang.T("tray.show"), null, (_, _) => ShowFromTray());
-        menu.Items.Add(Lang.T("tray.exit"), null, (_, _) => { _exiting = true; Close(); });
+        TrayMenuRenderer.Apply(_trayMenu);   // тёмный вид в стиле программы
+        if (!_mic.Sound) Win32.BeepEnabled = false;   // выключенный в меню звук помним между запусками
+        _trayMenu.Opening += (_, _) => BuildTrayMenu();
         _tray.Icon = _icoWhite;
         _tray.Text = "GPT Grabber";
         _tray.Visible = true;
-        _tray.ContextMenuStrip = menu;
-        _tray.DoubleClick += (_, _) => ShowFromTray();
+        _tray.ContextMenuStrip = _trayMenu;   // правый щелчок открывает меню сам
+        // Левый щелчок: меню - но выждав время двойного щелчка, иначе первый щелчок двойного открыл бы меню.
+        _trayClickTimer.Interval = SystemInformation.DoubleClickTime;
+        _trayClickTimer.Tick += (_, _) => { _trayClickTimer.Stop(); ShowTrayMenu(); };
+        _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) _trayClickTimer.Start(); };
+        _tray.MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) { _trayClickTimer.Stop(); ShowFromTray(); } };
+
+        _fgProc = OnForegroundChanged;
+        _fgHook = Win32.SetWinEventHook(Win32.EVENT_SYSTEM_FOREGROUND, Win32.EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _fgProc, 0, 0, Win32.WINEVENT_OUTOFCONTEXT);
+        IntPtr fg = Win32.GetForegroundWindow();
+        if (IsUserWindow(fg)) _lastUserWin = fg;
+    }
+
+    /// <summary>Показать меню трея по левому щелчку - тем же закрытым методом NotifyIcon, что и правый щелчок
+    /// (он правильно выводит меню на передний план и закрывает его щелчком мимо).</summary>
+    private void ShowTrayMenu()
+    {
+        try
+        {
+            typeof(NotifyIcon).GetMethod("ShowContextMenu", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                ?.Invoke(_tray, null);
+        }
+        catch (Exception ex) { Diag.Write("трей: меню не открылось: " + ex.Message); }
+    }
+
+    private void OnForegroundChanged(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        if (idObject == 0 && IsUserWindow(hwnd)) _lastUserWin = hwnd;
+    }
+
+    // Окна оболочки Windows, куда команда идти не должна: панель задач, лоток и его переполнение, меню, рабочий стол,
+    // «Пуск»/поиск, переключатель задач, миниатюры панели задач.
+    private static readonly HashSet<string> ShellClasses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
+        "#32768", "Progman", "WorkerW", "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow",
+        "ForegroundStaging", "MultitaskingViewFrame", "TaskListThumbnailWnd",
+    };
+
+    /// <summary>Окно человека: живое, не наше (окно программы, пилюля, меню трея) и не оболочка Windows.</summary>
+    private static bool IsUserWindow(IntPtr h)
+    {
+        if (h == IntPtr.Zero || !Win32.IsWindow(h)) return false;
+        Win32.GetWindowThreadProcessId(h, out uint pid);
+        if (pid == (uint)Environment.ProcessId) return false;
+        var sb = new System.Text.StringBuilder(128);
+        Win32.GetClassName(h, sb, sb.Capacity);
+        return !ShellClasses.Contains(sb.ToString());
+    }
+
+    /// <summary>Собрать меню трея под текущее состояние (зовётся при каждом открытии).</summary>
+    private void BuildTrayMenu()
+    {
+        _trayMenu.Items.Clear();
+        string ctrlWin = Lang.T("key.ctrl") + "+Win";
+        ToolStripMenuItem Cmd(string text, string keys, Action act)
+        {
+            var it = new ToolStripMenuItem(text) { ShortcutKeyDisplayString = keys };
+            it.Click += (_, _) => RunFromTray(act);
+            return it;
+        }
+        switch (_state)
+        {
+            case LiveState.Idle:
+            case LiveState.File:   // во время файла куклы - как Ctrl+Win: вытеснение и живая диктовка
+                _trayMenu.Items.Add(Cmd(Lang.T("tray.start"), ctrlWin, () => OnToggle(false)));
+                break;
+            case LiveState.Recording:
+                _trayMenu.Items.Add(Cmd(Lang.T("tray.stop"), ctrlWin, () => OnToggle(false)));
+                _trayMenu.Items.Add(Cmd(Lang.T("tray.stop_keep"), ctrlWin + "+Y", () => OnToggle(true)));
+                if (_mic.Stream && IsUserWindow(_lastUserWin) && _stream?.Target != _lastUserWin)
+                    _trayMenu.Items.Add(Cmd(Lang.T("tray.move", Trunc(Win32.GetWindowTitle(_lastUserWin))), "Shift+Win", OnMoveStream));
+                break;
+            default:               // Starting / Stopping: Ctrl+Win здесь - отмена
+                _trayMenu.Items.Add(Cmd(Lang.T("tray.cancel"), ctrlWin, () => OnToggle(false)));
+                break;
+        }
+        var repaste = Cmd(Lang.T("tray.repaste"), "Win+Alt", OnRepaste);
+        repaste.Enabled = !string.IsNullOrEmpty(_lastText);
+        _trayMenu.Items.Add(repaste);
+
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        ToolStripMenuItem Mode(string text, bool on, bool stream, bool auto)
+        {
+            var it = new ToolStripMenuItem(text) { Checked = on };
+            it.Click += (_, _) => SetStreamMode(stream, auto);
+            return it;
+        }
+        _trayMenu.Items.Add(Mode(Lang.T("mode.normal"), !_mic.Stream, false, false));
+        _trayMenu.Items.Add(Mode(Lang.T("mode.manual"), _mic.Stream && !_mic.StreamAuto, true, false));
+        _trayMenu.Items.Add(Mode(Lang.T("mode.auto"), _mic.Stream && _mic.StreamAuto, true, true));
+
+        // Звук: все пики программы - вставка, ошибка, отсчёт, напоминание (просьба пользователя 22.11.2026).
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        var sound = new ToolStripMenuItem(Lang.T("tray.sound")) { Checked = Win32.BeepEnabled };
+        sound.Click += (_, _) =>
+        {
+            Win32.BeepEnabled = !Win32.BeepEnabled;
+            _mic.Sound = Win32.BeepEnabled;
+            _mic.Save();
+            Diag.Write("звук: " + (Win32.BeepEnabled ? "включён" : "выключен"));
+        };
+        _trayMenu.Items.Add(sound);
+
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add(Lang.T("tray.show"), null, (_, _) => ShowFromTray());
+        _trayMenu.Items.Add(Lang.T("tray.exit"), null, (_, _) => { _exiting = true; Close(); });
+        foreach (ToolStripItem it in _trayMenu.Items) TrayMenuRenderer.StyleItem(it);
+    }
+
+    /// <summary>Команда из меню трея: вернуть на передний план окно, где человек был до клика по трею, и выполнить
+    /// команду так же, как от клавиш (обработчики берут цель из активного окна). Отложено через BeginInvoke -
+    /// сперва меню закрывается до конца.</summary>
+    private void RunFromTray(Action act)
+    {
+        BeginInvoke(new Action(() =>
+        {
+            IntPtr win = _lastUserWin;
+            if (!IsUserWindow(win))
+            {
+                Win32.FeedbackBeep(false);
+                Log(Lang.T("tray.no_window"));
+                return;
+            }
+            bool ok = Injector.ForceForeground(win);
+            Diag.Write($"трей: команда в «{Trunc(Win32.GetWindowTitle(win))}» (окно впереди={ok})");
+            act();
+        }));
     }
 
     /// <summary>
@@ -290,6 +431,7 @@ internal sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _hotkey?.Dispose();
+        if (_fgHook != IntPtr.Zero) Win32.UnhookWinEvent(_fgHook);
         _fileEntry?.Dispose();
         StatusOverlay.Destroy();
         _tray.Visible = false;
@@ -322,6 +464,10 @@ internal sealed class MainForm : Form
                 try { msg = e.TryGetWebMessageAsString(); } catch { return; }
                 if (msg == "gg:toolbar") BeginInvoke(new Action(ToggleToolbar));
                 else if (msg == "gg:help") BeginInvoke(new Action(ToggleHelp));
+                else if (msg == "gg:mode:normal") BeginInvoke(new Action(() => SetStreamMode(false, false)));
+                else if (msg == "gg:mode:stream") BeginInvoke(new Action(() => SetStreamMode(true, false)));
+                else if (msg == "gg:mode:stream-auto") BeginInvoke(new Action(() => SetStreamMode(true, true)));
+                else if (msg is not null && msg.StartsWith("gg:voice:")) BeginInvoke(new Action(() => OnVoiceMessage(msg)));
             };
             _web.CoreWebView2.NavigationCompleted += async (_, e) =>
             {
@@ -329,7 +475,14 @@ internal sealed class MainForm : Form
                 if (e.IsSuccess)
                 {
                     await Exec(HideExtrasScript);    // спрятать лишний блок под #thread-bottom (CSS живёт в head)
-                    await Exec(OverlayInjectScript); // плавающие кнопки (тулбар/справка) в правом нижнем углу
+                    await Exec(OverlayInjectScript   // плавающие кнопки: все справа внизу: режимы, промежуток, тулбар и справка
+                        .Replace("__TIP_NORMAL__", System.Text.Json.JsonSerializer.Serialize(Lang.T("mode.normal_tip")))
+                        .Replace("__TIP_STREAM__", System.Text.Json.JsonSerializer.Serialize(Lang.T("mode.stream_tip")))
+                        .Replace("__TIP_MANUAL__", System.Text.Json.JsonSerializer.Serialize(Lang.T("mode.manual_tip")))
+                        .Replace("__TIP_AUTO__", System.Text.Json.JsonSerializer.Serialize(Lang.T("mode.auto_tip")))
+                        .Replace("__LBL_MANUAL__", System.Text.Json.JsonSerializer.Serialize(Lang.T("mode.manual")))
+                        .Replace("__LBL_AUTO__", System.Text.Json.JsonSerializer.Serialize(Lang.T("mode.auto"))));
+                    PushStreamMode();                // подсветить кнопку сохранённого режима
                     await PopulateMicsAsync();       // список микрофонов в тулбар (метки уже доступны — разрешение выдано)
                     await PollPageReadyAsync();      // /status.ready - сразу, не дожидаясь таймера
                     if (!_firstClearDone)
@@ -337,6 +490,10 @@ internal sealed class MainForm : Form
                         _firstClearDone = true;
                         await Task.Delay(1500);          // дать странице осесть
                         await Exec(ClearComposerScript); // снять восстановленный из сессии черновик
+                        // Справку готовим заранее, в скрытой панели: при первом «?» запуск второго WebView2 был
+                        // заметной паузой (замечание пользователя 22.11.2026: «хреновенько выглядит»).
+                        await Task.Delay(1000);
+                        await EnsureHelpViewAsync();
                     }
                 }
             };
@@ -365,6 +522,7 @@ internal sealed class MainForm : Form
         if (m.Msg == (int)WmShowExisting) { ShowFromTray(); return; } // второй экземпляр попросил показать окно
         if (m.Msg == (int)Win32.WM_APP_TOGGLE) { OnToggle(m.WParam != IntPtr.Zero); return; }
         if (m.Msg == (int)Win32.WM_APP_REPASTE) { OnRepaste(); return; }
+        if (m.Msg == (int)Win32.WM_APP_MOVE) { OnMoveStream(); return; }
         base.WndProc(ref m);
     }
 
@@ -532,6 +690,7 @@ internal sealed class MainForm : Form
                 return;
             }
             _fileEndsAt = DateTime.Now.AddSeconds(job.AudioSec + 1);
+            Diag.Write($"{tag}: караоке: " + await Exec(LiveShowScript));
 
             // Конец звука: флаг onended со страницы; не пришёл за длину + 5 с → стоп по времени.
             int tries = (int)(job.AudioSec * 4) + 20;
@@ -547,8 +706,13 @@ internal sealed class MainForm : Form
             while (true)
             {
                 await Task.Delay(500, ct);
+                // Текст в композере есть ещё до стопа (поток, 19.11.2026), а хвост доезжает в фазе завершения:
+                // берём его, только когда страница вернулась в покой (см. ReadFinalTextAsync). Страховка от
+                // застрявшего завершения: через 20 с берём то, что есть.
+                string fin = await Exec(FinalStateScript);
                 text = await Exec(ComposerReadScript);
-                if (GoodText(text)) break;
+                if (GoodText(text) && (fin == "idle" || (fin == "unknown" && rec.ElapsedMilliseconds >= 1500)
+                                       || rec.Elapsed.TotalSeconds >= 20)) break;
                 bool stillRec = (await Exec(DictationStateScript)).Contains("\"live\":true");
                 if (!stillRec && rec.Elapsed.TotalSeconds >= 20) break;
                 if (rec.Elapsed.TotalSeconds >= 60) { timedOut = true; break; }
@@ -590,12 +754,18 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task StartDictationAsync()
+    /// <param name="fromVoice">Автозапуск сторожем голоса («Поток-авто»): сторож уже взвёл передачу буфера
+    /// (VoiceArmScript), его микрофон и накопленное начало фразы уходят в запись - не глушить.</param>
+    private async Task StartDictationAsync(bool fromVoice = false)
     {
         State = LiveState.Starting;
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
-        OverlayShow(StatusOverlay.Phase.Preparing, Win32.GetForegroundWindow());
+        // Окно, где человек был в момент хоткея: якорь пилюли и приёмник потокового режима.
+        IntPtr startWin = Win32.GetForegroundWindow();
+        _stream = null;
+        if (!fromVoice) StopVoiceWatch();   // запись включили руками - сторож голоса больше не нужен, микрофон отпускаем
+        OverlayShow(StatusOverlay.Phase.Preparing, startWin);
         try
         {
             // Страница могла остаться в режиме записи от прошлого раза (окно закрыли, программу
@@ -635,7 +805,16 @@ internal sealed class MainForm : Form
 
             State = LiveState.Recording;
             OverlaySet(StatusOverlay.Phase.Recording);
-            Log("micdiag: " + await Exec(MicDiagScript));   // ВРЕМЕННО: факты о перехвате getUserMedia
+            Diag.Write("micdiag: " + await Exec(MicDiagScript));   // факты о перехвате getUserMedia - только в файл журнала
+            Diag.Write("караоке: " + await Exec(LiveShowScript));
+            if (fromVoice)
+            {
+                // Подхватила ли страница наш поток с буфером (перехватчик getUserMedia → handover сторожа).
+                string h = await Exec(VoiceHandedScript);
+                Diag.Write("буфер: " + h);
+                if (!h.StartsWith("handed")) ReleaseVoice();   // запись идёт с обычного микрофона - сторожу держать нечего
+            }
+            StartStream(startWin);
         }
         catch (OperationCanceledException)
         {
@@ -649,40 +828,60 @@ internal sealed class MainForm : Form
             OverlaySet(StatusOverlay.Phase.Error, Lang.T("err.start_failed"));
             State = LiveState.Idle;
         }
+        finally
+        {
+            if (fromVoice && _state != LiveState.Recording) ReleaseVoice();   // автозапуск сорвался - микрофон сторожа отпустить
+        }
     }
 
-    private async Task StopAndInjectAsync(bool withY)
+    /// <param name="auto">Автостоп по тишине (поток), а не Ctrl+Win: приёмник силой не поднимаем.</param>
+    private async Task StopAndInjectAsync(bool withY, bool auto = false)
     {
         State = LiveState.Stopping;
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
         // Окно-цель = где сейчас работает пользователь; туда же якорим пилюлю.
+        // В потоковом режиме цель - приёмник, выбранный на старте (часть текста уже в нём).
+        var stream = _stream;
         IntPtr target = Win32.GetForegroundWindow();
         OverlayShow(StatusOverlay.Phase.Transcribing, target);
+        string? fullForClipboard = null;   // поток: текст, который надо оставить в буфере (Ctrl+Win+Y или расхождение)
         try
         {
+            await DrainVoiceBufferAsync(ct);   // запись с буфером отстаёт от живого голоса - конец фразы не обрезать
             Diag.Write("Submit: " + await Exec(SubmitScript));
-            Log("micdiag@stop: " + await Exec(MicDiagScript));   // ВРЕМЕННО: пиковый уровень за время записи
+            Diag.Write("micdiag@stop: " + await Exec(MicDiagScript));   // пиковый уровень за время записи - только в файл журнала
 
-            string text = "";
-            for (int i = 0; i < 40; i++)
-            {
-                await Task.Delay(500, ct);
-                text = await Exec(ComposerReadScript);
-                if (GoodText(text)) break;
-            }
+            string text = await ReadFinalTextAsync(ct);
 
             if (GoodText(text))
             {
                 _lastText = text; // запоминаем для повторной вставки (Win+Alt)
-                bool ok = Injector.Inject(text, target, withY);
+                bool ok;
+                string? errText = null;
+                if (stream is null)
+                {
+                    ok = Injector.Inject(text, target, withY);
+                    if (!ok) errText = Lang.T("err.paste_failed");
+                    Diag.Write($"inject ok={ok} window=«{Win32.GetWindowTitle(target)}»" + (withY ? " (+buffer)" : ""));
+                }
+                else
+                {
+                    ok = await StreamFinishAsync(stream, text, ct, force: !auto);
+                    if (stream.Broken || withY) fullForClipboard = text;
+                    // Автостоп, а человек в другом окне: хвост силой не вставляем (не выдёргиваем фокус) - кладём в буфер.
+                    else if (!ok && auto) fullForClipboard = text[stream.Sent.Length..];
+                    if (!ok) errText = Lang.T(stream.Broken || auto ? "err.stream_broken" : "err.paste_failed");
+                    Diag.Write($"поток: финал ok={ok} отдано {stream.Sent.Length} из {text.Length} window=«{Win32.GetWindowTitle(stream.Target)}»"
+                        + (stream.Broken ? " (расхождение, текст в буфер)" : withY ? " (+buffer)" : ""));
+                }
                 Win32.FeedbackBeep(ok);
-                OverlaySet(ok ? StatusOverlay.Phase.Done : StatusOverlay.Phase.Error, ok ? null : Lang.T("err.paste_failed"));
+                OverlaySet(ok ? StatusOverlay.Phase.Done : StatusOverlay.Phase.Error, errText);
                 Log(Lang.T("log.result", text));   // полный текст; обрезку делает само окно по правому краю
-                Diag.Write($"inject ok={ok} window=«{Win32.GetWindowTitle(target)}»" + (withY ? " (+buffer)" : ""));
             }
             else
             {
+                if (auto) Win32.FeedbackBeep(false);   // автостоп без текста: человек не нажимал стоп - пусть услышит, что запись закрылась
                 OverlaySet(StatusOverlay.Phase.Error, Lang.T("err.empty"));
                 Diag.Write("пусто (текста нет)");
             }
@@ -702,8 +901,485 @@ internal sealed class MainForm : Form
         }
         finally
         {
+            if (stream is not null) await StreamCloseAsync(stream, fullForClipboard);
+            _stream = null;
+            ReleaseVoice();   // микрофон сторожа, если запись шла с буфером
             State = LiveState.Idle;
+            // Окно сторожа после остановки записи (решение пользователя 21.11.2026): в «Потоке» - напоминание
+            // голосом про выключенную запись; в «Потоке-авто» - автозапуск, но только после автостопа:
+            // ручной Ctrl+Win-стоп автозапуск усыпляет до следующего ручного старта.
+            if (_mic.Stream && (!_mic.StreamAuto || auto)) StartVoiceWatch();
         }
+    }
+
+    // --------------------------- Сторож голоса ---------------------------
+    // После остановки записи в режимах потока страница VoiceWatchSec секунд слушает микрофон сама (оригинальный
+    // getUserMedia, мимо ChatGPT; на сервер ничего не уходит). Услышала голос - шлёт gg:voice:<уровень>:<порог>
+    // раз в ~0,25 с, пока он слышен. Дальше по режиму (решения пользователя 21.11.2026):
+    //  - «Поток»: первое сообщение эпизода = пик + жёлтая пилюля «Запись выключена · Ctrl+Win»; следующие её
+    //    держат, без голоса она гаснет сама через 3 с. Пик через колонки попадает в микрофон уже внутри эпизода.
+    //  - «Поток-авто»: голос держится AutoStartVoiceSec - запись включается сама, как от Ctrl+Win, в окно,
+    //    активное в этот момент. Чтобы начало фразы не потерялось (детект + подтверждение + 0,6-0,9 с до сервера),
+    //    сторож держит кольцевой буфер последних секунд звука и отдаёт записи свой поток: сперва звук с начала
+    //    фразы, затем живой; отставание съедается пропуском пауз длиннее 0,3 с (VoiceWatchScript, handover).
+    // После VoiceWatchSec сторож засыпает до ручного Ctrl+Win. Ручной старт сторожа снимает.
+
+    private const int VoiceWatchSec = 300;               // окно сторожа 5 мин (решение пользователя 21.11.2026)
+    private const double AutoStartVoiceSec = 1.0;        // «буквально через секунду» голоса - автозапуск
+    private DateTime _voiceFirst = DateTime.MinValue;    // начало текущего эпизода голоса (для автозапуска)
+    private DateTime _voiceLast = DateTime.MinValue;     // последнее сообщение голоса
+
+    private void StartVoiceWatch()
+    {
+        _voiceFirst = _voiceLast = DateTime.MinValue;
+        Log(Lang.T(_mic.StreamAuto ? "log.voice_watch_auto" : "log.voice_watch", VoiceWatchSec / 60));
+        _ = Exec(VoiceWatchScript.Replace("__MS__", (VoiceWatchSec * 1000).ToString()));
+    }
+
+    /// <summary>Снять сторожа: слушать перестаёт; микрофон отпускает, если запись не взяла его поток.</summary>
+    private void StopVoiceWatch() => _ = Exec("window.__ggVoiceStop && window.__ggVoiceStop()");
+
+    /// <summary>Освободить всё сторожево: поток микрофона, аудиоконтекст, буфер (конец записи с буфером).</summary>
+    private void ReleaseVoice() => _ = Exec("window.__ggVoiceRelease && window.__ggVoiceRelease()");
+
+    private void OnVoiceMessage(string msg)
+    {
+        // Итог прослушивания (сторож закончил): максимум уровня и шум - в журнал, по ним подбирается порог.
+        if (msg.StartsWith("gg:voice:end") || msg.StartsWith("gg:voice:err")) { Diag.Write("сторож голоса: " + msg); return; }
+        if (_state != LiveState.Idle) return;
+        if (!_mic.Stream) { StopVoiceWatch(); return; }   // режим сменили на «Обычный» - сторож не нужен
+
+        if (_mic.StreamAuto)
+        {
+            // Эпизод голоса: сообщения идут подряд с шагом ~0,25 с; разрыв больше 0,8 с - эпизод начинается заново.
+            var now = DateTime.Now;
+            if ((now - _voiceLast).TotalSeconds > 0.8) _voiceFirst = now;
+            _voiceLast = now;
+            if ((now - _voiceFirst).TotalSeconds < AutoStartVoiceSec - 0.05) return;
+            _voiceFirst = _voiceLast = DateTime.MinValue;
+            Diag.Write("сторож голоса: автозапуск, " + msg);
+            Log(Lang.T("log.voice_autostart"));
+            // Порядок держит очередь ExecuteScriptAsync: передача буфера взводится раньше, чем старт кликнет «Диктовать».
+            _ = Exec(VoiceArmScript);
+            _ = StartDictationAsync(fromVoice: true);
+            return;
+        }
+
+        if (StatusOverlay.WarnVisible) { StatusOverlay.KeepWarn(); return; }
+        Diag.Write("сторож голоса: голос, " + msg);
+        Win32.VoiceBeep();
+        OverlayShow(StatusOverlay.Phase.Warn, Win32.GetForegroundWindow());
+    }
+
+    /// <summary>
+    /// Перед Submit: запись с буфером отстаёт от живого голоса, пока не съедены паузы. Ждём, пока страница
+    /// получит хвост (отставание ≈ 0), не дольше 5 с - иначе последние слова отрезал бы стоп.
+    /// </summary>
+    private async Task DrainVoiceBufferAsync(CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        double lag0 = -1;
+        while (sw.Elapsed.TotalSeconds < 5)
+        {
+            string v = await Exec(VoiceLagScript);
+            if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out double lag) || lag <= 0.06) break;
+            if (lag0 < 0) lag0 = lag;
+            await Task.Delay(100, ct);
+        }
+        if (lag0 > 0) Diag.Write($"буфер: доигран хвост {lag0:0.00} с за {sw.ElapsedMilliseconds} мс");
+    }
+
+    // Взвести передачу: следующий getUserMedia страницы получит поток сторожа (буфер с начала фразы + живой звук).
+    private const string VoiceArmScript = """
+(function () {
+  var V = window.__ggVoice;
+  if (!V || !V.handover || V.handed) return 'none';
+  V.armed = true;
+  return 'armed';
+})()
+""";
+
+    // Чем кончилась передача: handed (страница взяла поток сторожа: сколько секунд буфера, с какого момента) или нет.
+    private const string VoiceHandedScript = """
+(function () {
+  var V = window.__ggVoice;
+  if (!V) return 'none';
+  if (V.handed) return 'handed buf=' + V.handBuf.toFixed(2) + 's lag=' + V.lag().toFixed(2) + 's';
+  return V.armed ? 'armed, но страница поток не взяла' : 'не взведён';
+})()
+""";
+
+    // Отставание записи от живого звука, секунды (0 - буфера нет или догнали).
+    private const string VoiceLagScript = """
+(function () {
+  var V = window.__ggVoice;
+  return (V && V.handed && V.lag) ? String(V.lag()) : '0';
+})()
+""";
+
+    // Сторож в странице. Звук идёт через ScriptProcessor блоками по 2048 отсчётов (~43 мс при 48 кГц); каждый блок -
+    // в кольцевой буфер (RING_SEC) и в детект. ScriptProcessor, а не AudioWorklet: модуль ворклета грузится по адресу
+    // (blob/data), и CSP страницы ChatGPT может его не пустить; ScriptProcessor живёт прямо в нашем скрипте.
+    // Детект: уровень - RMS сырого блока (без шумодава и АРУ). Первые 0,7 с пропускаем (в них попадает наш же сигнал
+    // вставки), следующие 0,6 с слушаем шум комнаты; порог = max(0.003, шум × 3), шум в расчёте не выше 0.004 (если
+    // человек заговорил прямо во время замера), дальше медленно подстраивается по тихим блокам. Голос = порог превышен
+    // в 3 блоках подряд с допуском (~0,15 с). Замер 21.11.2026 на микрофоне пользователя (усиление выключено): шум
+    // 0.0011-0.0014, голос 0.006-0.022; первая нижняя граница 0.012 была выше тихого голоса.
+    // Передача (handover, «Поток-авто»): C# взводит V.armed, перехватчик getUserMedia (MicBoostTemplate) зовёт
+    // V.handover() и отдаёт странице наш поток. В него идёт очередь: буфер с начала эпизода голоса минус PREROLL_SEC,
+    // дальше живые блоки. Первые START_DELAY_MS - тишина (рекордер ChatGPT берёт поток не мгновенно, как у входа
+    // «файл → текст»). Пока очередь длиннее одного блока (отставание), тихие блоки сверх SKIP_SEC подряд выкидываются -
+    // так запись догоняет живой голос на паузах. Усиление из тулбара применяется множителем (без лимитера).
+    // Освобождение - __ggVoiceRelease (конец записи, новый сторож); __ggVoiceStop только снимает детект и отпускает
+    // микрофон, если поток не взведён и не передан.
+    private const string VoiceWatchScript = """
+(function () {
+  if (window.__ggVoiceRelease) window.__ggVoiceRelease();
+  var orig = window.__ggMicOrig;
+  function post(s) { try { window.chrome.webview.postMessage(s); } catch (e) {} }
+  if (!orig) { post('gg:voice:err:no-orig'); return 'no-orig'; }
+  var BLOCK = 2048, RING_SEC = 15, PREROLL_SEC = 0.5, SKIP_SEC = 0.3, START_DELAY_MS = 600, EPISODE_GAP_SEC = 1.5;
+  var V = { detect: true, armed: false, handed: false, ring: [], queue: null, n: 0, rate: 48000,
+            floor: 0, floorN: 0, maxRms: 0, hot: 0, thr: 0.003, runStart: -1, voiceFrom: -1, lastHotN: -1e9,
+            lastPost: 0, quiet: 0, skipped: 0, drainAt: 0, handBuf: 0 };
+  window.__ggVoice = V;
+  var stream = null, ctx = null, proc = null, timer = null, released = false;
+  function endDetect() {
+    if (!V.detect) return;
+    V.detect = false;
+    if (timer) { clearTimeout(timer); timer = null; }
+    post('gg:voice:end:max=' + V.maxRms.toFixed(4) + ':floor=' + V.floor.toFixed(4) + ':skipped=' + V.skipped);
+  }
+  function release() {
+    if (released) return;
+    released = true;
+    endDetect();
+    V.armed = false; V.handed = false; V.queue = null; V.ring = [];
+    if (window.__ggVoice === V) { window.__ggVoice = null; window.__ggVoiceStop = null; window.__ggVoiceRelease = null; }
+    try { if (proc) proc.onaudioprocess = null; } catch (e) {}
+    try { if (stream) stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (ctx) ctx.close(); } catch (e) {}
+  }
+  window.__ggVoiceRelease = release;
+  window.__ggVoiceStop = function () { endDetect(); if (!V.armed && !V.handed) release(); };
+  timer = setTimeout(function () { timer = null; if (!V.armed && !V.handed) release(); else endDetect(); }, __MS__);
+  V.lag = function () { return V.queue ? V.queue.length * BLOCK / V.rate : 0; };
+  V.handover = function () {
+    if (!ctx || !proc || released) throw new Error('watch not ready');
+    var from = V.voiceFrom >= 0 ? V.voiceFrom - Math.round(PREROLL_SEC * V.rate / BLOCK) : V.n - Math.round(V.rate / BLOCK);
+    V.queue = V.ring.filter(function (b) { return b.n >= from; });
+    V.ring = [];
+    V.handBuf = V.queue.length * BLOCK / V.rate;
+    V.armed = false; V.handed = true;
+    endDetect();
+    V.drainAt = Date.now() + START_DELAY_MS;
+    var dest = ctx.createMediaStreamDestination();
+    proc.connect(dest);
+    return dest.stream;
+  };
+  var a = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+  if (window.__ggMic && window.__ggMic.deviceId) a.deviceId = { exact: window.__ggMic.deviceId };
+  orig({ audio: a }).catch(function () { return orig({ audio: true }); }).then(function (s) {
+    if (released) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
+    stream = s;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    try { ctx.resume(); } catch (e) {}
+    V.rate = ctx.sampleRate;
+    var ringMax = Math.ceil(RING_SEC * V.rate / BLOCK), gapN = Math.round(EPISODE_GAP_SEC * V.rate / BLOCK),
+        skipN = Math.round(SKIP_SEC * V.rate / BLOCK);
+    var src = ctx.createMediaStreamSource(s);
+    proc = ctx.createScriptProcessor(BLOCK, 1, 1);
+    var mute = ctx.createGain(); mute.gain.value = 0;   // ScriptProcessor работает, только пока его выход кто-то тянет
+    src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+    proc.onaudioprocess = function (e) {
+      var inp = e.inputBuffer.getChannelData(0), out = e.outputBuffer.getChannelData(0);
+      var d = new Float32Array(inp), sum = 0;
+      for (var i = 0; i < d.length; i++) sum += d[i] * d[i];
+      var rms = Math.sqrt(sum / d.length), blk = { n: V.n++, d: d, rms: rms };
+      if (V.handed) {
+        V.queue.push(blk);
+        if (Date.now() < V.drainAt) { out.fill(0); return; }
+        var b;
+        for (;;) {
+          b = V.queue.shift();
+          if (b.rms < V.thr) V.quiet++; else V.quiet = 0;
+          if (V.quiet > skipN && V.queue.length > 0) { V.skipped++; continue; }
+          break;
+        }
+        var m = window.__ggMic, g = (m && m.enabled && m.gain) ? m.gain : 1;
+        for (var j = 0; j < out.length; j++) { var v = b.d[j] * g; out[j] = v > 1 ? 1 : (v < -1 ? -1 : v); }
+        return;
+      }
+      out.fill(0);
+      V.ring.push(blk);
+      if (V.ring.length > ringMax) V.ring.shift();
+      if (!V.detect || V.armed) return;
+      var age = blk.n * BLOCK / V.rate;
+      if (age < 0.7) return;
+      if (age < 1.3) { V.floor = (V.floor * V.floorN + rms) / (V.floorN + 1); V.floorN++; return; }
+      if (rms > V.maxRms) V.maxRms = rms;
+      V.thr = Math.max(0.003, Math.min(V.floor, 0.004) * 3);
+      if (rms > V.thr) { if (V.hot === 0) V.runStart = blk.n; V.hot = Math.min(6, V.hot + 1); }
+      else { V.hot = Math.max(0, V.hot - 1); V.floor = V.floor * 0.98 + rms * 0.02; }
+      if (V.hot >= 3) {
+        // Начало эпизода голоса - отсюда (минус PREROLL_SEC) запись получит буфер; пауза больше EPISODE_GAP_SEC - новый эпизод.
+        if (V.voiceFrom < 0 || blk.n - V.lastHotN > gapN) V.voiceFrom = V.runStart;
+        V.lastHotN = blk.n;
+        var now = Date.now();
+        if (now - V.lastPost >= 250) { V.lastPost = now; post('gg:voice:' + rms.toFixed(4) + ':' + V.thr.toFixed(4)); }
+      }
+    };
+  }).catch(function (e) { post('gg:voice:err:' + (e && e.name || e)); });
+  return 'ok';
+})()
+""";
+
+    /// <summary>
+    /// Итоговый текст после Submit. С 19.11.2026 ChatGPT распознаёт потоком: слова идут в композер во время
+    /// записи, а хвост доезжает уже ПОСЛЕ стопа, в короткой фазе «Finishing dictation» (~0,6 с). Брать первый
+    /// непустой текст, как раньше, нельзя - он есть сразу, и последние слова терялись бы. Ждём, пока страница
+    /// вернётся в покой, и читаем после этого. Покой с пустым композером = тишина, сразу «пусто».
+    /// Подписи не узнаны ('unknown') - по времени: непустой текст, но не раньше 1,5 с после стопа.
+    /// </summary>
+    private async Task<string> ReadFinalTextAsync(CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        string text = "";
+        while (sw.Elapsed.TotalSeconds < 20)
+        {
+            await Task.Delay(250, ct);
+            string st = await Exec(FinalStateScript);
+            text = await Exec(ComposerReadScript);   // читаем ПОСЛЕ состояния: покой уже наступил - текст окончательный
+            if (st == "idle") break;
+            if (st == "unknown" && GoodText(text) && sw.ElapsedMilliseconds >= 1500) break;
+        }
+        return text;
+    }
+
+    // --------------------------- Потоковый режим ---------------------------
+    // Режим выбирается кнопками на странице (справа внизу): «Обычный» / «Поток»; у «Потока» по клику всплывает выбор
+    // «Поток» (ручной) или «Поток-авто». Пока идёт запись, раз в StreamPollMs читаем композер и отдаём в приёмник
+    // (окно, активное в момент хоткея) всё новое. Ctrl+Win заканчивает запись и досылает хвост.
+    // Опора (исследование 21.11.2026, ~4900 ревизий): сервер только дописывает текст, уже выданное не правит.
+    // Страховка на случай, если начнёт править: расхождение с отданным → поток молчит до конца диктовки,
+    // на стопе весь текст кладётся в буфер. Подмены текста в чужом окне нет.
+
+    private const int StreamPollMs = 500;        // порции «раз в ~0,5 с» (решение пользователя 21.11.2026)
+    private const int StreamPasteGapMs = 200;    // минимум между вставками: приёмник должен успеть прочитать буфер
+    // Автостоп: столько секунд без новых слов - запись заканчивается сама, как от Ctrl+Win. В потоке текст уже
+    // на месте, и про стоп забывают: микрофон слушал бы дальше, а следующее Ctrl+Win «на старт» останавливало бы
+    // забытую запись (так и было на проверке 21.11.2026). Тишина меряется по тексту композера, не по звуку:
+    // шум в комнате не мешает. Отсчёт идёт и до первого слова.
+    private const int StreamSilenceSec = 6;      // было 10 (решение пользователя 22.11.2026: «сократим с десяти секунд до шести»)
+    private const int StreamWarnSec = 2;         // после стольких секунд тишины - кружок отсчёта в пилюле
+    private const int StreamBeepEverySec = 2;    // пик отсчёта раз в 2 с (решение пользователя 22.11.2026: «раз в две секунды, чуть пореже»)
+    // Автостоп и отсчёт - только в «Потоке-авто». В ручном «Потоке» вместо них напоминание раз в StreamRemindSec тишины.
+    private const int StreamRemindSec = 5;
+
+    private sealed class StreamSession
+    {
+        public IntPtr Target;                    // окно-приёмник
+        public string Sent = "";                 // что уже вставлено: точное начало текста композера
+        public bool Broken;                      // уже вставленное изменилось на странице
+        public bool ClipTouched;                 // мы уже клали порцию в буфер
+        public string? PrevClip;                 // текст буфера до первой порции - вернуть в конце
+        public DateTime LastPaste = DateTime.MinValue;
+        public string LastText = "";             // текст композера на прошлом чтении - для отсчёта тишины
+        public DateTime LastChange = DateTime.Now;   // когда текст композера менялся в последний раз (или старт потока)
+        public int Count;                            // цифра отсчёта тишины, на которую уже прозвучали пики (0 - отсчёта нет)
+    }
+    private StreamSession? _stream;
+
+    /// <summary>Запустить поток для начавшейся записи, если режим включён.</summary>
+    private void StartStream(IntPtr startWin)
+    {
+        if (!_mic.Stream || _state != LiveState.Recording) return;
+        // Приёмник - наше собственное окно: вставка попала бы в композер ChatGPT, из которого мы же читаем текст.
+        Win32.GetWindowThreadProcessId(startWin, out uint pid);
+        if (startWin == IntPtr.Zero || pid == (uint)Environment.ProcessId)
+        {
+            Log(Lang.T("log.stream_own"));
+            return;
+        }
+        _stream = new StreamSession { Target = startWin };
+        Log(Lang.T("log.stream_start", Win32.GetWindowTitle(startWin)));
+        _ = StreamLoopAsync(_stream);
+    }
+
+    private async Task StreamLoopAsync(StreamSession s)
+    {
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(StreamPollMs);
+                if (_state != LiveState.Recording || !ReferenceEquals(_stream, s) || s.Broken) break;
+                string text = await Exec(ComposerReadScript);
+                // Пока читали страницу, мог прийти стоп - тогда хвост дошлёт StopAndInjectAsync, не мы.
+                if (_state != LiveState.Recording || !ReferenceEquals(_stream, s)) break;
+                StreamPush(s, text, final: false);
+
+                if (GoodText(text) && text != s.LastText)
+                {
+                    s.LastText = text; s.LastChange = DateTime.Now;
+                    s.Count = 0;
+                    StatusOverlay.SetCountdown(0);   // заговорил снова - кружок отсчёта убираем
+                }
+                else if (!_mic.StreamAuto)
+                {
+                    // Ручной «Поток»: запись не кончается никогда; в тишине - кружок без цифры и пик-пик раз в
+                    // StreamRemindSec (решение пользователя 21.11.2026: «напоминалка… раз в 5 секунд»).
+                    double silence = (DateTime.Now - s.LastChange).TotalSeconds;
+                    if (silence >= StreamRemindSec)
+                    {
+                        int n = (int)(silence / StreamRemindSec);
+                        if (n != s.Count) { s.Count = n; Win32.CountBeep(); }
+                        StatusOverlay.SetCountdown(StatusOverlay.CountdownDot);
+                    }
+                }
+                else
+                {
+                    double silence = (DateTime.Now - s.LastChange).TotalSeconds;
+                    if (silence >= StreamSilenceSec)
+                    {
+                        Log(Lang.T("log.stream_autostop", StreamSilenceSec));
+                        _ = StopAndInjectAsync(withY: false, auto: true);
+                        break;
+                    }
+                    if (silence >= StreamWarnSec)
+                    {
+                        // Кружок с остатком секунд до автостопа: 4…1; одинарный пик раз в StreamBeepEverySec - на 4 и 2
+                        // (решения пользователя: 21.11.2026 «пикать всё время, что идёт таймер», «не двойные, а одинарные»;
+                        // 22.11.2026 «раз в две секунды»).
+                        int left = (int)Math.Ceiling(StreamSilenceSec - silence);
+                        if (left != s.Count)
+                        {
+                            s.Count = left;
+                            if ((StreamSilenceSec - left) % StreamBeepEverySec == 0) Win32.CountBeep();
+                        }
+                        StatusOverlay.SetCountdown(left);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { Diag.Write("поток: ошибка цикла: " + ex.Message); }
+    }
+
+    /// <summary>
+    /// Отдать в приёмник то, чего в нём ещё нет: приращение текста композера с прошлой порции.
+    /// Без force - только в активный приёмник и не при зажатой клавише; force (стоп по Ctrl+Win) - приёмник поднимаем.
+    /// false - порция не ушла (нечего слать, приёмник не активен, зажата клавиша, буфер занят, расхождение).
+    /// </summary>
+    private bool StreamPush(StreamSession s, string text, bool final, bool force = false)
+    {
+        if (s.Broken || !GoodText(text)) return false;
+        if (!text.StartsWith(s.Sent, StringComparison.Ordinal))
+        {
+            // Композер на миг короче отданного (перерисовка) - не новость, ждём следующего чтения.
+            if (!final && s.Sent.StartsWith(text, StringComparison.Ordinal)) return false;
+            s.Broken = true;
+            Log(Lang.T("log.stream_broken"));
+            Diag.Write($"поток: расхождение: отдано «…{Tail(s.Sent)}», на странице «…{Tail(text.Length > s.Sent.Length ? text[..s.Sent.Length] : text)}»");
+            return false;
+        }
+
+        // Отдаём всё, что есть, вместе с последним словом (проверка пользователя 21.11.2026: «последнее слово не
+        // переносится», оно ждало следующего пробела). Слово может прийти кусками («Ев» → «Еврова»), но сервер
+        // только дописывает, и кусок с продолжением склеиваются в приёмнике сами. Пробел перед словом приходит
+        // вместе со словом: текст композера читается обрезанным по краям.
+        int end = text.Length;
+        if (end == s.Sent.Length) return final;                        // нового нет; на стопе это «досылать нечего»
+        string delta = text[s.Sent.Length..end];
+
+        if (!force)
+        {
+            // Человек ушёл в другое окно - копим, вставим, когда вернётся (решение пользователя 21.11.2026).
+            if (Win32.GetForegroundWindow() != s.Target) return false;
+            if (Injector.ModifierDown()) return false;
+        }
+        if (!Injector.PasteChunk(delta, s.Target, force, out string? prev))
+        {
+            Diag.Write("поток: порция не ушла (буфер занят или окна нет)");
+            return false;
+        }
+        if (!s.ClipTouched) { s.ClipTouched = true; s.PrevClip = prev; }
+        // Каждая порция - в файл журнала (не в окно): что и куда ушло. Нужна для разбора жалоб на лишний текст.
+        Diag.Write($"поток: порция {s.Sent.Length}..{end}{(final ? " (хвост)" : "")} → «{Trunc(Win32.GetWindowTitle(s.Target))}»: «{delta}»");
+        s.Sent = text[..end];
+        s.LastPaste = DateTime.Now;
+        return true;
+    }
+
+    /// <summary>Стоп в потоковом режиме: дослать хвост итогового текста в приёмник.</summary>
+    /// <param name="force">Поднять приёмник (стоп по Ctrl+Win). false - автостоп: вставляем, только если приёмник
+    /// и так активен; зажатую клавишу пережидаем до полутора секунд.</param>
+    private async Task<bool> StreamFinishAsync(StreamSession s, string text, CancellationToken ct, bool force)
+    {
+        // Последняя порция могла уйти только что - дать приёмнику прочитать буфер, прежде чем класть в него хвост.
+        int wait = StreamPasteGapMs - (int)(DateTime.Now - s.LastPaste).TotalMilliseconds;
+        if (wait > 0) await Task.Delay(wait, ct);
+        for (int i = 0; !force && i < 15 && Injector.ModifierDown(); i++) await Task.Delay(100, ct);
+        bool ok = StreamPush(s, text, final: true, force: force);
+        return ok && !s.Broken;
+    }
+
+    /// <summary>Конец потока (вставка, отмена, ошибка): вернуть буфер обмена. keep задан - оставить в буфере его
+    /// (Ctrl+Win+Y или расхождение), иначе - то, что лежало там до первой порции.</summary>
+    private async Task StreamCloseAsync(StreamSession s, string? keep)
+    {
+        try
+        {
+            if (keep is null && !(s.ClipTouched && s.PrevClip is not null)) return;
+            int wait = 300 - (int)(DateTime.Now - s.LastPaste).TotalMilliseconds;   // как ClipboardRestoreDelayMs у обычной вставки
+            if (wait > 0) await Task.Delay(wait);
+            Clip.SetUnicodeText(keep ?? s.PrevClip!, out _);
+        }
+        catch (Exception ex) { Diag.Write("поток: возврат буфера: " + ex.Message); }
+    }
+
+    private static string Tail(string t) => t.Length > 40 ? t[^40..] : t;
+
+    /// <summary>Кнопка режима на странице: «Обычный», «Поток» (ручной) или «Поток-авто». Поток/обычный - со
+    /// следующей диктовки; ручной/авто внутри потока - сразу (отсчёт и автостоп читаются на каждом шаге цикла).</summary>
+    private void SetStreamMode(bool stream, bool auto)
+    {
+        _mic.Stream = stream;   // в файл не пишется: следующий запуск снова в обычном режиме
+        _mic.StreamAuto = stream && auto;
+        PushStreamMode();
+        if (!stream && _state == LiveState.Idle) StopVoiceWatch();   // «Обычный» - сторож не нужен
+        Diag.Write("режим: " + (!stream ? "обычный" : auto ? "поток-авто" : "поток"));
+    }
+
+    /// <summary>Подсветить на странице кнопку текущего режима.</summary>
+    private void PushStreamMode() =>
+        _ = Exec("window.__ggSetMode && window.__ggSetMode(" + (_mic.Stream ? "true" : "false") + ", " + (_mic.StreamAuto ? "true" : "false") + ")");
+
+    /// <summary>
+    /// Shift+Win во время потоковой записи: приёмником становится окно, где человек сейчас. Уже вставленное
+    /// остаётся в прежнем окне, продолжение (и накопленное за время перехода) идёт в новое - ближайшим тиком
+    /// цикла. Пилюля перескакивает к новому окну: видимый знак, что перенос сработал.
+    /// </summary>
+    private void OnMoveStream()
+    {
+        if (_state != LiveState.Recording || !_mic.Stream) return;
+        IntPtr win = Win32.GetForegroundWindow();
+        Win32.GetWindowThreadProcessId(win, out uint pid);
+        if (win == IntPtr.Zero || pid == (uint)Environment.ProcessId)
+        {
+            Win32.FeedbackBeep(false);   // в собственное окно нельзя: вставка попала бы в композер ChatGPT
+            Diag.Write("перенос потока: отказ (окно GPT Grabber)");
+            return;
+        }
+        if (_stream is null)
+        {
+            // Запись начата из окна GPT Grabber - потока не было; перенос его заводит, всё накопленное уйдёт сюда.
+            _stream = new StreamSession { Target = win };
+            _ = StreamLoopAsync(_stream);
+        }
+        else if (_stream.Target == win) return;
+        else _stream.Target = win;
+        OverlayShow(StatusOverlay.Phase.Recording, win);
+        Log(Lang.T("log.stream_moved", Win32.GetWindowTitle(win)));
     }
 
     /// <summary>Повторная вставка последнего текста (Win+Alt) — в текущее активное окно.</summary>
@@ -893,7 +1569,13 @@ internal sealed class MainForm : Form
     {
         _helpPanel.Visible = !_helpPanel.Visible;
         _logRow.Height = _helpPanel.Visible ? LogRowHelpPx : LogRowNormalPx; // под справку лог повыше
-        if (_helpPanel.Visible) _helpPanel.BringToFront();
+        if (_helpPanel.Visible)
+        {
+            _helpPanel.BringToFront();
+            if (_helpSpinner.Visible) { _helpSpinner.BringToFront(); _helpSpinner.Spin(true); }
+            _ = EnsureHelpViewAsync();
+        }
+        else _helpSpinner.Spin(false);
     }
 
     /// <summary>Тёмная тема MaterialSkin + шрифт Rubik (вшитый Roboto подменяем рефлексией).</summary>
@@ -936,7 +1618,6 @@ internal sealed class MainForm : Form
             if (!string.IsNullOrEmpty(json) && json != "null" && json != "\"\"") break;
             await Task.Delay(150);
         }
-        Diag.Write("enum raw: " + json);           // ВРЕМЕННО: что реально вернул enumerateDevices
         try
         {
             using var doc = System.Text.Json.JsonDocument.Parse(json);
@@ -986,71 +1667,188 @@ internal sealed class MainForm : Form
         var host = new Panel { Dock = DockStyle.Fill };
         host.Controls.Add(_log); // _log уже настроен (Dock=Fill)
 
-        // Панель помощи — скрыта; по «?» накрывает лог. Внутри read-only многострочное
-        // поле: само скроллит/переносит, если справки больше, чем влезает в полосу лога.
+        // Панель помощи — скрыта; по «?» накрывает лог. Внутри - своя маленькая веб-страница (HelpView),
+        // её WebView2 создаётся при первом открытии справки (22.11.2026: прежнее поле TextBox с Segoe UI
+        // пользователь забраковал - «некрасиво, ужасно»).
         _helpPanel = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = Color.FromArgb(30, 30, 34),
-            // Отступ ТОЛЬКО слева (текст не липнет к краю). Право/верх/низ = 0, чтобы скролл-балка
-            // вложенного поля прилегала ко всем стенкам окна (как у лога), без промежутков.
-            Padding = new Padding(14, 0, 0, 0),
             Visible = false,
         };
-        _helpPanel.Controls.Add(new TextBox
-        {
-            Dock = DockStyle.Fill,
-            Multiline = true,
-            ReadOnly = true,
-            BorderStyle = BorderStyle.None,
-            BackColor = Color.FromArgb(30, 30, 34),
-            ForeColor = Color.Gainsboro,
-            Font = new Font("Segoe UI", 10f),
-            ScrollBars = ScrollBars.Vertical,
-            WordWrap = true,
-            TabStop = false,
-            Cursor = Cursors.Default,
-            Text = HotkeyHelpText(),
-        });
-        // Номер версии — в правом верхнем углу справки, на её пустой первой строке; справа отступ
-        // под полосу прокрутки поля. Версия сборки = package.json (см. csproj).
-        var version = new Label
-        {
-            AutoSize = true,
-            BackColor = Color.FromArgb(30, 30, 34),
-            ForeColor = Color.FromArgb(120, 120, 128),
-            Font = new Font("Segoe UI", 9f),
-            Text = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "",
-        };
-        _helpPanel.Controls.Add(version);
-        version.BringToFront();
-        void PlaceVersion() =>
-            version.Location = new Point(_helpPanel.ClientSize.Width - version.Width - 24, 6);
-        _helpPanel.Resize += (_, _) => PlaceVersion();
-        _helpPanel.VisibleChanged += (_, _) => PlaceVersion(); // скрытую панель докинг не раскладывает
+        // Спиннер поверх панели, пока страница справки не загрузилась (просьба пользователя 22.11.2026:
+        // быстрый клик по «?» показывал пустую тёмную панель). Только значок, без подписи.
+        _helpSpinner = new HelpSpinner { Dock = DockStyle.Fill, BackColor = _helpPanel.BackColor };
+        _helpPanel.Controls.Add(_helpSpinner);
         host.Controls.Add(_helpPanel);
         return host;
     }
 
-    /// <summary>Локализованный список хоткеев для панели помощи.</summary>
-    private static string HotkeyHelpText()
+    // --------------------------- Справка (кнопка «?») ---------------------------
+    // Маленькая веб-страница в своём WebView2 внутри панели справки (22.11.2026, вместо TextBox с Segoe UI).
+    // Страницу и шрифт отдаёт сама программа через WebResourceRequested с адреса https://gg-help.local/ -
+    // в сеть ничего не уходит, файлов не пишем; один источник у страницы и шрифта - CORS для @font-face не мешает.
+    // Шрифт - Montserrat (выбран пользователем по образцам 22.11.2026; Poppins похож, но без кириллицы),
+    // переменный, файл fonts/Montserrat-Variable.ttf. Тексты - из Lang (help.*), клавиши рисуются кнопками.
+    // Окружение WebView2 - то же, что у ChatGPT: второе окружение на том же профиле с другими параметрами не поднимется.
+    // Ссылки (репозиторий) открываются в браузере по умолчанию.
+
+    private const string HelpHost = "https://gg-help.local/";
+    private const string RepoUrl = "https://github.com/paperisque/gptbridge";   // просьба пользователя 21.11.2026
+    private WebView2? _helpView;
+    private bool _helpViewStarting;
+    private HelpSpinner _helpSpinner = null!;
+
+    private async Task EnsureHelpViewAsync()
     {
-        string nl = Environment.NewLine;
-        return nl + Lang.T("help.title") + nl + nl   // пустая строка сверху — отступ от края
-            + "•  " + Lang.T("help.dictate") + nl
-            + "•  " + Lang.T("help.keepbuf") + nl
-            + "•  " + Lang.T("help.repaste") + nl
-            + "•  " + Lang.T("help.cancel") + nl + nl
-            + Lang.T("help.mic_title") + nl
-            + "•  " + Lang.T("help.mic_desc") + nl + nl
-            + Lang.T("help.flags_title") + nl
-            + "•  " + Lang.T("help.flag_lang") + nl
-            + "•  " + Lang.T("help.flag_tray") + nl
-            + "•  " + Lang.T("help.flag_nobeep") + nl
-            + "•  " + Lang.T("help.flag_api_host") + nl
-            + "•  " + Lang.T("help.flag_api_port") + nl
-            + "•  " + Lang.T("help.flag_devtools");
+        if (_helpView is not null || _helpViewStarting || _web.CoreWebView2 is null) return;
+        _helpViewStarting = true;
+        var helpSw = Stopwatch.StartNew();
+        try
+        {
+            var view = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(30, 30, 34) };
+            _helpPanel.Controls.Add(view);
+            _helpSpinner.BringToFront();   // спиннер закрывает ещё пустую страницу
+            _ = view.Handle;   // панель скрыта (фоновая подготовка) - окно контрола создаём явно, иначе WebView2 ждал бы показа
+            await view.EnsureCoreWebView2Async(_web.CoreWebView2.Environment);
+            var core = view.CoreWebView2;
+            core.Settings.AreDefaultContextMenusEnabled = false;
+            core.Settings.IsZoomControlEnabled = false;
+            core.Settings.IsStatusBarEnabled = false;
+            core.Settings.AreDevToolsEnabled = false;
+            core.AddWebResourceRequestedFilter(HelpHost + "*", CoreWebView2WebResourceContext.All);
+            core.WebResourceRequested += (_, e) => e.Response = HelpResponse(core.Environment, e.Request.Uri);
+            core.NavigationStarting += (_, e) =>
+            {
+                if (e.Uri.StartsWith(HelpHost, StringComparison.OrdinalIgnoreCase)) return;
+                e.Cancel = true;
+                OpenInBrowser(e.Uri);
+            };
+            core.NewWindowRequested += (_, e) => { e.Handled = true; OpenInBrowser(e.Uri); };
+            core.NavigationCompleted += (_, e) =>
+            {
+                Diag.Write($"справка: страница загружена (ok={e.IsSuccess}) за {helpSw.ElapsedMilliseconds} мс от старта WebView2");
+                _helpSpinner.Spin(false);
+                _helpSpinner.Visible = false;
+            };
+            core.Navigate(HelpHost + "help.html");
+            _helpView = view;
+        }
+        catch (Exception ex) { Diag.Write("справка: WebView2 не поднялся: " + ex.Message); }
+        finally { _helpViewStarting = false; }
     }
+
+    private static void OpenInBrowser(string url)
+    {
+        if (!url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return;
+        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+        catch (Exception ex) { Diag.Write("ссылка: " + ex.Message); }
+    }
+
+    /// <summary>Ответ на запрос страницы справки: help.html - собранный HTML, fonts/&lt;файл&gt; - шрифт из папки программы.</summary>
+    private static CoreWebView2WebResourceResponse HelpResponse(CoreWebView2Environment env, string uri)
+    {
+        string path = Uri.TryCreate(uri, UriKind.Absolute, out var u) ? u.AbsolutePath.TrimStart('/') : "";
+        try
+        {
+            if (path == "help.html")
+                return env.CreateWebResourceResponse(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(HelpHtml())),
+                    200, "OK", "Content-Type: text/html; charset=utf-8");
+            if (path.StartsWith("fonts/", StringComparison.Ordinal))
+            {
+                string file = Path.Combine(AppContext.BaseDirectory, "fonts", Path.GetFileName(path));   // только имя файла: наружу папки fonts не выйти
+                if (File.Exists(file))
+                    return env.CreateWebResourceResponse(new MemoryStream(File.ReadAllBytes(file)), 200, "OK", "Content-Type: font/ttf");
+            }
+        }
+        catch (Exception ex) { Diag.Write("справка: " + path + ": " + ex.Message); }
+        return env.CreateWebResourceResponse(null, 404, "Not Found", "");
+    }
+
+    private static string H(string s) => System.Net.WebUtility.HtmlEncode(s);
+
+    /// <summary>Строка хоткея «Ctrl+Win — описание»: клавиши в начале → кнопки, остальное - текст.</summary>
+    private static string HelpKeyRow(string line)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(line,
+            @"^((?:Ctrl|Strg|Win|Alt|Shift|Y)(?:\+(?:Ctrl|Strg|Win|Alt|Shift|Y))*)\s*(?:[—-]\s+)?(.*)$");
+        if (!m.Success) return "<div class=\"row\"><span class=\"txt\">" + H(line) + "</span></div>";
+        string keys = string.Join("<span class=\"plus\">+</span>", m.Groups[1].Value.Split('+').Select(k => "<kbd>" + H(k) + "</kbd>"));
+        return "<div class=\"row\"><span class=\"keys\">" + keys + "</span><span class=\"txt\">" + H(m.Groups[2].Value) + "</span></div>";
+    }
+
+    /// <summary>Строка параметра запуска «--flag ЗНАЧЕНИЕ — описание»: параметр - моноширинным, описание - текстом.</summary>
+    private static string HelpFlagRow(string line)
+    {
+        int i = line.IndexOf(" — ", StringComparison.Ordinal), j = line.IndexOf(" - ", StringComparison.Ordinal);
+        int k = i < 0 ? j : j < 0 ? i : Math.Min(i, j);
+        if (k < 0) return "<div class=\"row\"><span class=\"txt\">" + H(line) + "</span></div>";
+        return "<div class=\"row flag\"><code>" + H(line[..k]) + "</code><span class=\"txt\">" + H(line[(k + 3)..]) + "</span></div>";
+    }
+
+    /// <summary>Абзац о режимах: названия режимов - жирным (длинные первыми: «Поток-авто» раньше «Поток»).</summary>
+    private static string HelpModesPara(string text)
+    {
+        string html = H(text);
+        var names = new[] { Lang.T("mode.auto"), Lang.T("mode.manual"), Lang.T("mode.normal") }
+            .Select(H).Distinct().OrderByDescending(n => n.Length).ToArray();
+        string pattern = "(?<![\\p{L}-])(" + string.Join("|", names.Select(System.Text.RegularExpressions.Regex.Escape)) + ")(?![\\p{L}-])";
+        return "<p>" + System.Text.RegularExpressions.Regex.Replace(html, pattern, "<b>$1</b>") + "</p>";
+    }
+
+    private static string HelpHtml()
+    {
+        string ver = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "";
+        string Title(string key) => H(Lang.T(key).TrimEnd(':', ' '));
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<!doctype html><html><head><meta charset=\"utf-8\"><style>").Append(HelpCss).Append("</style></head><body>");
+        sb.Append("<header><span class=\"app\">GPT Grabber</span><span class=\"ver\">").Append(H(ver)).Append("</span>")
+          .Append("<a class=\"repo\" href=\"").Append(RepoUrl).Append("\">github.com/paperisque/gptbridge</a></header>");
+        sb.Append("<main>");
+        sb.Append("<section><h2>").Append(Title("help.title")).Append("</h2>");
+        foreach (var key in new[] { "help.dictate", "help.keepbuf", "help.repaste", "help.move", "help.cancel" })
+            sb.Append(HelpKeyRow(Lang.T(key)));
+        sb.Append("</section>");
+        sb.Append("<section><h2>").Append(Title("help.modes_title")).Append("</h2>")
+          .Append(HelpModesPara(Lang.T("help.stream"))).Append(HelpModesPara(Lang.T("help.autostop"))).Append("</section>");
+        sb.Append("<section><h2>").Append(Title("help.mic_title")).Append("</h2><p>").Append(H(Lang.T("help.mic_desc"))).Append("</p></section>");
+        sb.Append("<section><h2>").Append(Title("help.flags_title")).Append("</h2>");
+        foreach (var key in new[] { "help.flag_lang", "help.flag_tray", "help.flag_nobeep", "help.flag_api_host", "help.flag_api_port", "help.flag_devtools" })
+            sb.Append(HelpFlagRow(Lang.T(key)));
+        sb.Append("</section></main></body></html>");
+        return sb.ToString();
+    }
+
+    // Тёмная гамма в тон кнопкам на странице ChatGPT (акцент #81d4fa). Карточки разделов встают в две колонки,
+    // если хватает ширины. Полоса прокрутки тёмная, у правого края - как у лога.
+    private const string HelpCss = """
+@font-face { font-family: "Montserrat"; src: url("/fonts/Montserrat-Variable.ttf") format("truetype"); font-weight: 100 900; }
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; background: #1e1e22; }
+body { font: 400 13px/1.55 "Montserrat", "Segoe UI", sans-serif; color: #cfcfd6; padding: 12px 14px 16px; }
+::-webkit-scrollbar { width: 12px; }
+::-webkit-scrollbar-track { background: #1e1e22; }
+::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 6px; border: 3px solid #1e1e22; }
+::-webkit-scrollbar-thumb:hover { background: #4a4a56; }
+header { display: flex; align-items: baseline; gap: 10px; margin: 0 2px 12px; }
+.app { font-weight: 600; font-size: 14px; color: #fff; }
+.ver { font-size: 12px; color: #7c7c88; }
+.repo { margin-left: auto; font-size: 12px; color: #81d4fa; text-decoration: none; }
+.repo:hover { text-decoration: underline; }
+main { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 12px; align-items: start; }
+section { background: #26262c; border: 1px solid #33333c; border-radius: 12px; padding: 12px 16px 14px; }
+h2 { font-size: 11.5px; font-weight: 600; color: #81d4fa; text-transform: uppercase; letter-spacing: .07em; margin: 0 0 8px; }
+.row { display: flex; gap: 12px; align-items: baseline; margin: 6px 0; }
+.keys { flex: 0 0 auto; min-width: 112px; white-space: nowrap; }
+kbd { display: inline-block; font: 500 11.5px "Montserrat", "Segoe UI", sans-serif; color: #fff; background: #34343e;
+      border: 1px solid #4a4a56; border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; line-height: 1.6; }
+.plus { color: #6f6f7a; margin: 0 3px; font-size: 11px; }
+.flag { flex-direction: column; gap: 2px; margin: 8px 0; }
+code { font: 500 12px Consolas, "Cascadia Mono", monospace; color: #e6e6ea; background: #34343e; border-radius: 4px; padding: 1px 6px; align-self: flex-start; }
+p { margin: 6px 0; }
+b { color: #fff; font-weight: 600; }
+""";
 
     // --------------------------- JS-скрипты ---------------------------
     // Селекторы кнопок ChatGPT локализованы — матчим EN/DE/RU (см. историю POC).
@@ -1102,8 +1900,18 @@ var GG = (function () {
   // Идёт ли запись — только по кнопкам. Раньше считалось и по пропавшему #prompt-textarea: 10.10 id исчез
   // навсегда, и «запись идёт» стало вечным, что отключило позиционный фолбэк.
   function recording() { return !!(byAria(STOP) || byAria(CANCEL)); }
+  // Караоке (19.11.2026): слова по ходу записи показывает сама страница, но только после клика по кнопке
+  // «Show live transcription». Кнопка - полоса звуковой волны между «Отменой» и «Стопом»: в записи иконки
+  // формы [отмена, волна, стоп, отправить], и волна - единственная из них без svg. Подпись локализована
+  // (сняты только английские «Show/Hide live transcription»), поэтому запас - по этому признаку.
+  var LIVE = /^show live transcription/i;
+  var LIVE_ON = /^hide live transcription/i;
+  function wave() {
+    var a = icons().filter(function (b) { return !b.querySelector('svg'); });
+    return a.length === 1 ? a[0] : null;
+  }
   return { form: form, root: root, composer: composer, buttons: buttons, byAria: byAria, icons: icons, second: second,
-           recording: recording, START: START, STOP: STOP, CANCEL: CANCEL };
+           recording: recording, wave: wave, START: START, STOP: STOP, CANCEL: CANCEL, LIVE: LIVE, LIVE_ON: LIVE_ON };
 })();
 """;
 
@@ -1136,12 +1944,13 @@ var GG = (function () {
 })()
 """;
 
-    // Плавающие круглые кнопки в правом нижнем углу страницы (поверх контента): «микрофон+волны»
-    // (показать/скрыть тулбар) и «?» (справка). CSS даёт ровные бордеры/ховер (Region в WinForms не сглаживался).
+    // Плавающие круглые кнопки справа внизу страницы (поверх контента): режимы «Обычный» / «Поток» (решение
+    // пользователя 21.11.2026: режимам не место в тулбаре усиления звука; 22.11.2026 переехали слева направо -
+    // закрывали аватар), промежуток, «микрофон+волны» (показать/скрыть тулбар) и «?» (справка). Выбранный режим залит акцентом. __TIP_*__ - подсказки, подставляются из Lang. CSS даёт ровные бордеры/ховер (Region в WinForms не сглаживался).
     // Клик → postMessage → C# (WebMessageReceived). Идемпотентно + self-heal на случай перерисовок React.
     private const string OverlayInjectScript = """
 (function () {
-  var MIC = '<svg width="20" height="16" viewBox="0 0 32 24" fill="none" xmlns="http://www.w3.org/2000/svg">'
+  var MIC = '<svg width="24" height="19" viewBox="0 0 32 24" fill="none" xmlns="http://www.w3.org/2000/svg">'
     + '<rect x="3" y="3" width="7" height="12" rx="3.5" fill="currentColor"/>'
     + '<path d="M1.5 11.5a5 5 0 0 0 10 0" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>'
     + '<line x1="6.5" y1="16.5" x2="6.5" y2="20.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>'
@@ -1149,16 +1958,102 @@ var GG = (function () {
     + '<path d="M19 5a11 11 0 0 1 0 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity="0.5"/>'
     + '<path d="M23 2.5a15 15 0 0 1 0 19" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity="0.26"/>'
     + '</svg>';
+  // Значки режимов (выбраны пользователем 21.11.2026 по образцам): «Обычный» - пустой квадрат (залитый читался бы
+  // как «идёт запись»), «Поток» - волна над строчками (звук переходит в текст).
+  var SVG24 = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">';
+  var NORMAL = SVG24 + '<rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>';
+  var STREAM = SVG24 + '<path d="M2.5 8c1.6-4 3.2-4 4.8 0s3.2 4 4.8 0 3.2-4 4.8 0 3.2 4 4.6 0"/><path d="M3 15h18"/><path d="M3 19.5h11"/></svg>';
+  // Вид кнопки: выбранная (b.__ggOn - кнопка текущего режима) залита акцентом, остальные - тёмные с подсветкой под мышью.
+  function paint(b, hover) {
+    if (b.__ggOn) { b.style.background = '#81d4fa'; b.style.color = '#1b1b20'; b.style.borderColor = '#81d4fa'; }
+    else if (hover) { b.style.background = 'rgba(62,62,72,.96)'; b.style.color = '#fff'; b.style.borderColor = 'rgba(255,255,255,.6)'; }
+    else { b.style.background = 'rgba(38,38,44,.92)'; b.style.color = '#c9c9cf'; b.style.borderColor = 'rgba(255,255,255,.3)'; }
+  }
+  // Кнопки 44 px (было 36, +20% - решение пользователя 22.11.2026), значки увеличены в той же пропорции.
   function mkBtn(id, html, title) {
     var b = document.createElement('button');
     b.id = id; b.title = title; b.innerHTML = html;
-    b.style.cssText = 'width:36px;height:36px;border-radius:50%;border:2px solid rgba(255,255,255,.35);'
+    b.style.cssText = 'width:44px;height:44px;border-radius:50%;border:2px solid rgba(255,255,255,.35);'
       + 'background:rgba(38,38,44,.92);color:#c9c9cf;cursor:pointer;padding:0;margin:0;'
-      + 'display:flex;align-items:center;justify-content:center;font:600 16px Rubik,sans-serif;'
+      + 'display:flex;align-items:center;justify-content:center;font:600 19px Rubik,sans-serif;'
       + 'box-shadow:0 2px 7px rgba(0,0,0,.4);transition:background .12s,color .12s,border-color .12s;';
-    b.addEventListener('mouseenter', function () { b.style.background = 'rgba(62,62,72,.96)'; b.style.color = '#fff'; b.style.borderColor = 'rgba(255,255,255,.6)'; });
-    b.addEventListener('mouseleave', function () { b.style.background = 'rgba(38,38,44,.92)'; b.style.color = '#c9c9cf'; b.style.borderColor = 'rgba(255,255,255,.3)'; });
+    b.addEventListener('mouseenter', function () { paint(b, true); });
+    b.addEventListener('mouseleave', function () { paint(b, false); });
     return b;
+  }
+  function post(m) { try { window.chrome.webview.postMessage(m); } catch (e) {} }
+  // Режим приходит из программы (сохранённая настройка) и после клика; помним в window - переживает перерисовки.
+  // auto - подрежим потока «Поток-авто»: на кнопке «Поток» значок «A».
+  window.__ggSetMode = function (stream, auto) {
+    window.__ggMode = !!stream;
+    window.__ggAuto = !!stream && !!auto;
+    var n = document.getElementById('ggModeNormal'), s = document.getElementById('ggModeStream');
+    var badge = document.getElementById('ggModeAutoBadge');
+    if (n) { n.__ggOn = !stream; paint(n, false); }
+    if (s) { s.__ggOn = !!stream; paint(s, false); }
+    if (badge) badge.style.display = window.__ggAuto ? 'flex' : 'none';
+  };
+  // Выбор подрежима потока (решение пользователя 21.11.2026): кнопка «Поток» одна; каждый клик по ней
+  // открывает над ней два варианта - «Поток-авто» и «Поток» (ручной), текущий залит. Ничего не скрыто.
+  function closeMenu() { var m = document.getElementById('ggModeMenu'); if (m) m.remove(); }
+  function openMenu(anchor) {
+    closeMenu();
+    var r = anchor.getBoundingClientRect();
+    var m = document.createElement('div');
+    m.id = 'ggModeMenu';
+    m.style.cssText = 'position:fixed;right:' + Math.round(window.innerWidth - r.right) + 'px;bottom:' + Math.round(window.innerHeight - r.top + 8) + 'px;'
+      + 'z-index:2147483647;display:flex;flex-direction:column;gap:4px;padding:5px;border-radius:12px;'
+      + 'background:rgba(30,30,36,.97);border:1px solid rgba(255,255,255,.28);box-shadow:0 4px 14px rgba(0,0,0,.5);';
+    function item(label, tip, msg, on) {
+      var b = document.createElement('button');
+      b.textContent = label; b.title = tip;
+      b.style.cssText = 'text-align:left;white-space:nowrap;padding:7px 14px;border-radius:8px;border:none;cursor:pointer;'
+        + 'font:500 14px Rubik,sans-serif;' + (on ? 'background:#81d4fa;color:#1b1b20;' : 'background:transparent;color:#e6e6ea;');
+      if (!on) {
+        b.addEventListener('mouseenter', function () { b.style.background = 'rgba(62,62,72,.96)'; });
+        b.addEventListener('mouseleave', function () { b.style.background = 'transparent'; });
+      }
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); closeMenu(); post(msg); });
+      return b;
+    }
+    m.appendChild(item(__LBL_AUTO__, __TIP_AUTO__, 'gg:mode:stream-auto', window.__ggMode && window.__ggAuto));
+    m.appendChild(item(__LBL_MANUAL__, __TIP_MANUAL__, 'gg:mode:stream', window.__ggMode && !window.__ggAuto));
+    document.documentElement.appendChild(m);
+  }
+  if (!window.__ggMenuDocHook) {
+    window.__ggMenuDocHook = true;
+    // Клик мимо выбора закрывает его (клик по самой кнопке «Поток» решает её обработчик).
+    document.addEventListener('mousedown', function (ev) {
+      var m = document.getElementById('ggModeMenu');
+      if (!m || m.contains(ev.target)) return;
+      if (ev.target.closest && ev.target.closest('#ggModeStream')) return;
+      closeMenu();
+    }, true);
+  }
+  function ensureModes() {
+    if (document.getElementById('ggModes')) return;
+    var wrap = document.createElement('div');
+    wrap.id = 'ggModes';
+    // Справа внизу, левее кнопок панели микрофона и «?» (16 + 44 + 8 + 44 = 112 px) с промежутком 20 px -
+    // слева они закрывали аватар пользователя в боковой панели ChatGPT (решение пользователя 22.11.2026).
+    wrap.style.cssText = 'position:fixed;right:132px;bottom:16px;z-index:2147483647;display:flex;gap:8px;';
+    var n = mkBtn('ggModeNormal', NORMAL, __TIP_NORMAL__);
+    var s = mkBtn('ggModeStream', STREAM, __TIP_STREAM__);
+    s.style.position = 'relative';
+    var badge = document.createElement('span');
+    badge.id = 'ggModeAutoBadge';
+    badge.textContent = 'A';
+    badge.style.cssText = 'position:absolute;right:-4px;top:-4px;width:17px;height:17px;border-radius:50%;'
+      + 'background:#ffca28;color:#1b1b20;font:700 12px Rubik,sans-serif;display:none;align-items:center;'
+      + 'justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,.5);pointer-events:none;';
+    s.appendChild(badge);
+    n.addEventListener('click', function () { closeMenu(); post('gg:mode:normal'); });
+    s.addEventListener('click', function () {
+      if (document.getElementById('ggModeMenu')) closeMenu(); else openMenu(s);
+    });
+    wrap.appendChild(n); wrap.appendChild(s);
+    document.documentElement.appendChild(wrap);
+    window.__ggSetMode(window.__ggMode, window.__ggAuto);
   }
   function ensure() {
     if (document.getElementById('ggOverlay')) return;
@@ -1172,8 +2067,8 @@ var GG = (function () {
     wrap.appendChild(mic); wrap.appendChild(help);
     document.documentElement.appendChild(wrap);
   }
-  ensure();
-  if (!window.__ggOverlayHeal) { window.__ggOverlayHeal = setInterval(ensure, 1500); }
+  ensure(); ensureModes();
+  if (!window.__ggOverlayHeal) { window.__ggOverlayHeal = setInterval(function () { ensure(); ensureModes(); }, 1500); }
   return 'ok';
 })()
 """;
@@ -1208,6 +2103,33 @@ var GG = (function () {
     private static readonly string DictationStateScript = Js("""
 (function () {
   return JSON.stringify({ live: GG.recording(), composerGone: !GG.composer() });
+})()
+""");
+
+    // Включить караоке на идущей записи. Состояние между записями страница не помнит - жмём на каждой.
+    // Уже включено - не трогаем, иначе выключили бы: признак aria-pressed="true" (от языка не зависит,
+    // срез 21.11.2026) или подпись «Hide…».
+    private static readonly string LiveShowScript = Js("""
+(function () {
+  if (!GG.recording()) return 'не в записи';
+  var b = GG.byAria(GG.LIVE) || GG.byAria(GG.LIVE_ON);
+  var how = 'aria';
+  if (!b) { b = GG.wave(); how = 'по признаку (иконка без svg)'; }
+  if (!b) return 'кнопка НЕ найдена';
+  if (b.getAttribute('aria-pressed') === 'true' || GG.LIVE_ON.test(b.getAttribute('aria-label') || '')) return 'уже включено';
+  b.click();
+  return 'клик (' + how + ', aria="' + (b.getAttribute('aria-label') || '') + '")';
+})()
+""");
+
+    // Где страница после Submit: 'idle' - вернулась кнопка начала диктовки (по подписи, без позиционного запаса:
+    // в фазе «Finishing dictation» запас указал бы на чужую иконку); 'busy' - запись или завершение ещё идут;
+    // 'unknown' - подписи не узнаны (ChatGPT их сменил) - вызывающий работает по времени.
+    private static readonly string FinalStateScript = Js("""
+(function () {
+  if (GG.byAria(GG.START)) return 'idle';
+  if (GG.recording() || GG.wave()) return 'busy';
+  return 'unknown';
 })()
 """);
 
@@ -1389,6 +2311,17 @@ var GG = (function () {
         return fdest.stream;
       } catch (e) { f.state = 'error: ' + (e && e.message); window.__ggMicLast = 'file error'; }
     }
+    // АВТОЗАПУСК С БУФЕРОМ («Поток-авто»): сторож голоса взведён - отдаём его поток (начало фразы из буфера +
+    // живой звук, VoiceWatchScript). Один раз: handover сам снимает armed. Не вышло - обычный путь ниже.
+    var vw = window.__ggVoice;
+    if (wantAudio && vw && vw.armed && vw.handover) {
+      try {
+        var vs = vw.handover();
+        window.__ggMicTrack = 'voice buffer ' + vw.handBuf.toFixed(2) + 's';
+        window.__ggMicLast = 'voice-buffer';
+        return vs;
+      } catch (e) { vw.armed = false; window.__ggMicLast = 'voice-buffer error: ' + (e && e.message); }
+    }
     // ПОЛНЫЙ ОБХОД, когда усиление выключено: ведём себя ровно как обычный браузер —
     // никакого deviceId/NS/AGC/графа. Тогда «Усиление выкл» = честный baseline «как до внедрения».
     if (!wantAudio || !window.__ggMic.enabled) {
@@ -1536,4 +2469,35 @@ var GG = (function () {
         .Replace("__EN__", m.Enabled ? "true" : "false")
         .Replace("__GAIN__", m.Gain.ToString(CultureInfo.InvariantCulture))
         .Replace("__NS__", m.Noise ? "true" : "false");
+}
+
+/// <summary>Спиннер загрузки справки: голубая дуга крутится по таймеру, рисуется GDI+ со сглаживанием.</summary>
+internal sealed class HelpSpinner : Control
+{
+    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 30 };
+    private int _angle;
+
+    public HelpSpinner()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+        _timer.Tick += (_, _) => { _angle = (_angle + 12) % 360; Invalidate(); };
+    }
+
+    /// <summary>Запустить/остановить вращение (таймер крутится, только пока спиннер виден).</summary>
+    public void Spin(bool on) { if (on) _timer.Start(); else _timer.Stop(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        const int size = 36, width = 3;
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var r = new Rectangle((Width - size) / 2, (Height - size) / 2, size, size);
+        using var track = new Pen(Color.FromArgb(55, 55, 64), width);
+        using var arc = new Pen(Color.FromArgb(0x81, 0xd4, 0xfa), width) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        g.DrawEllipse(track, r);
+        g.DrawArc(arc, r, _angle, 100);
+    }
+
+    protected override void Dispose(bool disposing) { if (disposing) _timer.Dispose(); base.Dispose(disposing); }
 }
